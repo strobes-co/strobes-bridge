@@ -26,10 +26,19 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Lint
-        run: python -m py_compile strobes_shell_agent/cli.py strobes_shell_agent/client.py strobes_shell_agent/executor.py strobes_shell_agent/config.py strobes_shell_agent/pty_handler.py
+        run: python -m py_compile strobes_shell_agent/cli.py strobes_shell_agent/client.py strobes_shell_agent/executor.py strobes_shell_agent/config.py strobes_shell_agent/pty_handler.py strobes_shell_agent/service.py
 
       - name: Import smoke test
-        run: python -c "import strobes_shell_agent.cli, strobes_shell_agent.client, strobes_shell_agent.pty_handler; print('imports OK on', __import__('sys').platform)"
+        run: python -c "import strobes_shell_agent.cli, strobes_shell_agent.client, strobes_shell_agent.pty_handler, strobes_shell_agent.service; print('imports OK on', __import__('sys').platform)"
+
+      - name: Subcommands smoke test
+        run: |
+          strobes-shell-agent --help
+          strobes-shell-agent install-service --help
+          strobes-shell-agent uninstall-service --help
+          strobes-shell-agent status --help
+          strobes-shell-agent stop --help
+        shell: bash
 
       - name: CLI smoke test
         run: |

@@ -61,6 +61,7 @@ class ShellBridgeClient:
         self.ssl_verify = ssl_verify
         self._ws = None
         self._running = False
+        self._stop_event = asyncio.Event()
 
     @property
     def ws_url(self) -> str:
@@ -87,19 +88,18 @@ class ShellBridgeClient:
         while self._running:
             try:
                 logger.info(f"Connecting to {self.url}...")
-                ssl_context = None
+                connect_kwargs = {
+                    "ping_interval": None,  # We handle pings ourselves
+                    "max_size": 10_485_760,  # 10MB max message
+                    "close_timeout": 5,
+                }
                 if self.ws_url.startswith("wss://") and not self.ssl_verify:
                     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
+                    connect_kwargs["ssl"] = ssl_context
 
-                async with websockets.connect(
-                    self.ws_url,
-                    ping_interval=None,  # We handle pings ourselves
-                    max_size=10_485_760,  # 10MB max message
-                    close_timeout=5,
-                    ssl=ssl_context,
-                ) as ws:
+                async with websockets.connect(self.ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     backoff = INITIAL_BACKOFF  # Reset on successful connect
                     logger.info(f"Connected! Bridge ID: {self.bridge_id}")
@@ -107,11 +107,28 @@ class ShellBridgeClient:
                     # Send identify
                     await self._send_identify()
 
-                    # Run ping loop + message handler concurrently
-                    await asyncio.gather(
-                        self._ping_loop(),
-                        self._message_handler(),
+                    # Run ping loop + message handler. Whichever finishes
+                    # first (typically the message handler when the socket
+                    # closes) triggers cancellation of the other, so we
+                    # never wait out the ping interval before reconnecting.
+                    ping_task = asyncio.create_task(self._ping_loop())
+                    handler_task = asyncio.create_task(self._message_handler())
+                    done, pending = await asyncio.wait(
+                        {ping_task, handler_task},
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
+                    for t in pending:
+                        t.cancel()
+                    for t in pending:
+                        try:
+                            await t
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    # Surface any exception from the completed task
+                    for t in done:
+                        exc = t.exception()
+                        if exc:
+                            raise exc
             except ConnectionClosed as e:
                 logger.warning(f"Connection closed: {e}")
                 await close_all_pty()
@@ -126,7 +143,13 @@ class ShellBridgeClient:
                 break
 
             logger.info(f"Reconnecting in {backoff:.0f}s...")
-            await asyncio.sleep(backoff)
+            # Cancellable sleep: wakes up immediately if stop() is called.
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=backoff)
+                # stop_event was set during backoff: exit the loop.
+                break
+            except asyncio.TimeoutError:
+                pass
             backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
 
     async def _send_identify(self):
@@ -205,8 +228,8 @@ class ShellBridgeClient:
 
                 else:
                     logger.debug(f"Unknown message type: {msg_type}")
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as e:
+            logger.info(f"WebSocket closed: code={e.code} reason={e.reason!r}")
 
     async def _handle_pty_open(self, msg: dict):
         """Handle PTY open request from the platform."""
@@ -305,5 +328,6 @@ class ShellBridgeClient:
     def stop(self):
         """Signal the client to stop reconnecting."""
         self._running = False
+        self._stop_event.set()
         if self._ws:
             asyncio.create_task(self._ws.close())

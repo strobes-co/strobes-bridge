@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml .
 COPY strobes_shell_agent/ strobes_shell_agent/
+COPY tests/ tests/
 
 RUN pip install --no-cache-dir .
 
