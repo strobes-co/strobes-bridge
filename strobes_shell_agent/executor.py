@@ -2,14 +2,18 @@
 
 import asyncio
 import base64
-import glob
 import os
 import platform
+import shlex
 import shutil
+import signal
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+IS_WINDOWS = sys.platform == "win32"
 
 
 async def execute_shell_command(
@@ -17,15 +21,25 @@ async def execute_shell_command(
     timeout: int = 60,
     cwd: Optional[str] = None,
 ) -> dict:
-    """Execute a shell command via subprocess."""
+    """Execute a shell command via subprocess. Spawns in its own process group
+    so a timeout kills any child processes the command may have started."""
     start = time.monotonic()
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
+
+    popen_kwargs = {
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+        "cwd": cwd,
+    }
+    # New process group / job — lets us kill the whole tree on timeout.
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
+        proc = await asyncio.create_subprocess_shell(command, **popen_kwargs)
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=timeout
@@ -39,8 +53,11 @@ async def execute_shell_command(
                 "duration_ms": duration_ms,
             }
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            _kill_proc_group(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
             duration_ms = int((time.monotonic() - start) * 1000)
             return {
                 "success": False,
@@ -60,6 +77,27 @@ async def execute_shell_command(
             "duration_ms": duration_ms,
             "error": str(e),
         }
+
+
+def _kill_proc_group(proc):
+    """Kill the process and any children it spawned."""
+    if proc.returncode is not None:
+        return
+    if IS_WINDOWS:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    # Brief grace period, then SIGKILL.
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 async def execute_code(
@@ -92,18 +130,19 @@ async def execute_code(
             "duration_ms": 0,
         }
 
-    # Write to temp file and execute
+    # Use the default tempdir; cwd may not exist or may be unwritable.
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=suffix, delete=False, dir=cwd
+        mode="w", suffix=suffix, delete=False, encoding="utf-8"
     ) as f:
         f.write(code)
         temp_path = f.name
 
     try:
+        # shlex-quote the path so spaces / special chars are safe.
         result = await execute_shell_command(
-            f"{interpreter} {temp_path}",
+            f"{interpreter} {shlex.quote(temp_path)}",
             timeout=timeout,
-            cwd=cwd,
+            cwd=cwd if cwd and os.path.isdir(cwd) else None,
         )
         return result
     finally:
@@ -209,7 +248,11 @@ def upload_file(path: str, content_b64: str) -> dict:
 
 
 def download_file(path: str) -> dict:
-    """Download a file (returns base64-encoded content)."""
+    """Download a file (returns base64-encoded content).
+
+    The WebSocket max frame is 10MB and base64 inflates by ~33%, so the
+    raw file limit is set so the encoded payload still fits.
+    """
     try:
         p = Path(path).expanduser().resolve()
         if not p.exists():
@@ -217,9 +260,14 @@ def download_file(path: str) -> dict:
         if not p.is_file():
             return {"success": False, "error": f"Not a file: {path}"}
 
+        # Leave 256 KB headroom for the JSON envelope.
+        RAW_LIMIT = 7_700_000
         size = p.stat().st_size
-        if size > 10_485_760:  # 10MB limit
-            return {"success": False, "error": f"File too large: {size} bytes (max 10MB)"}
+        if size > RAW_LIMIT:
+            return {
+                "success": False,
+                "error": f"File too large: {size} bytes (max {RAW_LIMIT} bytes after base64 inflation)",
+            }
 
         content = base64.b64encode(p.read_bytes()).decode()
         return {"success": True, "content_b64": content, "size": size}

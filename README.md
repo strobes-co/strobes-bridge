@@ -200,12 +200,128 @@ strobes-shell-agent connect --url http://localhost:8001 --api-key sk-xxx --org-i
 # Connect to Strobes (main command)
 strobes-shell-agent connect [OPTIONS]
 
+# Connect and detach into the background (UNIX only)
+strobes-shell-agent connect --daemon [OPTIONS]
+
+# Check whether the daemonised agent is running
+strobes-shell-agent status
+
+# Stop the daemonised agent
+strobes-shell-agent stop
+
+# Register as a system service (auto-starts on boot, auto-restarts on crash)
+strobes-shell-agent install-service [OPTIONS]
+strobes-shell-agent uninstall-service
+
 # Show the persistent bridge ID for this machine
 strobes-shell-agent show-id
 
 # Show version
 strobes-shell-agent --version
 ```
+
+## Run as a daemon (UNIX)
+
+For ad-hoc background runs you can detach the process from the terminal:
+
+```bash
+strobes-shell-agent connect \
+  --url https://app.strobes.co \
+  --api-key sk-xxx \
+  --org-id YOUR-ORG \
+  --name "my-server" \
+  --daemon
+```
+
+- PID file → `~/.strobes-shell-agent/agent.pid`
+- Log file → `~/.strobes-shell-agent/agent.log`
+- Manage with `strobes-shell-agent status` / `stop`.
+
+`--daemon` is not the right tool for production — it doesn't survive reboots
+and isn't supervised. For that, install as a system service (next section).
+
+## Run as a system service (recommended for servers)
+
+`install-service` registers the agent with the platform's native service
+manager so it starts on boot and is restarted automatically if it crashes.
+
+### macOS (launchd)
+
+```bash
+strobes-shell-agent install-service \
+  --url https://app.strobes.co \
+  --api-key sk-xxx \
+  --org-id YOUR-ORG \
+  --name "my-laptop"
+```
+
+This writes `~/Library/LaunchAgents/co.strobes.shell-agent.plist` with
+`KeepAlive=true` and `RunAtLoad=true`, and loads it via `launchctl`. Logs:
+
+- stdout → `~/Library/Logs/strobes-shell-agent.out.log`
+- stderr → `~/Library/Logs/strobes-shell-agent.err.log`
+
+Stop / remove:
+
+```bash
+strobes-shell-agent uninstall-service
+```
+
+### Linux (systemd)
+
+```bash
+# Per-user service (default for non-root):
+strobes-shell-agent install-service \
+  --url https://app.strobes.co \
+  --api-key sk-xxx \
+  --org-id YOUR-ORG \
+  --name "my-server"
+
+systemctl --user status co.strobes.shell-agent.service
+journalctl --user -u co.strobes.shell-agent.service -f
+
+# System-wide (auto-detected when run as root):
+sudo strobes-shell-agent install-service \
+  --url https://app.strobes.co --api-key sk-xxx --org-id YOUR-ORG --scope system
+
+sudo systemctl status co.strobes.shell-agent
+```
+
+The generated unit uses `Restart=always` + `RestartSec=5` so the agent
+recovers from any crash, and `After=network-online.target` so it waits for
+the network at boot.
+
+Remove with `strobes-shell-agent uninstall-service` (add `--scope system`
+if it was installed system-wide).
+
+> User-scope systemd units only run while the user is logged in unless you
+> enable linger: `sudo loginctl enable-linger $USER`.
+
+### Windows
+
+`install-service` is not implemented for Windows. Use one of:
+
+```powershell
+# Option A: NSSM (Non-Sucking Service Manager)
+nssm install StrobesShellAgent "C:\path\to\strobes-shell-agent.exe" `
+  connect --url https://app.strobes.co --api-key sk-xxx --org-id YOUR-ORG
+
+# Option B: Task Scheduler — create a task that runs at logon and
+# restarts the program on failure.
+```
+
+## Reliability
+
+- **Auto-reconnect**: exponential backoff (1s → 60s cap) on any disconnect.
+  Wake-up is immediate when the socket closes — the ping interval no longer
+  delays reconnection.
+- **Process-tree kill on timeout**: when a shell command times out the
+  agent kills the whole process group, so any child processes the command
+  spawned also die.
+- **Graceful shutdown**: SIGINT / SIGTERM interrupts the current backoff
+  immediately; no waiting up to 60s to exit.
+- **Cross-platform**: tested on macOS (host) and Linux (Docker); Windows
+  binary is built and smoke-tested in CI.
 
 ## Security
 

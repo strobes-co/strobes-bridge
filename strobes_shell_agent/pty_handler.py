@@ -5,6 +5,7 @@ back through the WebSocket to the Strobes platform.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -14,7 +15,6 @@ IS_WINDOWS = sys.platform == "win32"
 if not IS_WINDOWS:
     import fcntl
     import pty
-    import select
     import signal
     import struct
     import termios
@@ -33,61 +33,66 @@ class PtySession:
         self.ws = ws
         self.shell = shell
         self.pid = None
-        self.fd = None
+        self.fd = None  # master fd
         self._running = False
-        self._read_task = None
+        self._reader_registered = False
 
     async def start(self, cols: int = 80, rows: int = 24):
         """Open a new PTY and start the shell process."""
-        # Find a suitable shell
         shell = self.shell
         for candidate in [os.environ.get("SHELL"), "/bin/bash", "/bin/zsh", "/bin/sh"]:
             if candidate and os.path.exists(candidate):
                 shell = candidate
                 break
 
-        # Fork a PTY
-        self.pid, self.fd = pty.openpty()
+        master_fd, slave_fd = pty.openpty()
+        # Set initial terminal size on the slave so SIGWINCH carries.
+        try:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+        except OSError as e:
+            logger.debug(f"[PTY] initial size error: {e}")
 
-        # Set initial terminal size
-        self._set_size(cols, rows)
+        try:
+            child_pid = os.fork()
+        except OSError:
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise
 
-        # Fork the actual shell process
-        child_pid = os.fork()
         if child_pid == 0:
-            # Child process
-            os.close(self.pid)  # Close master side in child
-            os.setsid()
+            # Child
+            try:
+                os.close(master_fd)
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+                os.dup2(slave_fd, 0)
+                os.dup2(slave_fd, 1)
+                os.dup2(slave_fd, 2)
+                if slave_fd > 2:
+                    os.close(slave_fd)
+                os.environ["TERM"] = "xterm-256color"
+                # --login only on shells we know support it
+                if shell.endswith(("/bash", "/zsh")):
+                    os.execlp(shell, shell, "--login")
+                else:
+                    os.execlp(shell, shell)
+            except Exception:
+                os._exit(127)
 
-            # Set up slave as controlling terminal
-            slave_fd = self.fd
-            fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        # Parent
+        os.close(slave_fd)
+        self.fd = master_fd
+        self.pid = child_pid
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-            # Redirect stdio
-            os.dup2(slave_fd, 0)
-            os.dup2(slave_fd, 1)
-            os.dup2(slave_fd, 2)
-            if slave_fd > 2:
-                os.close(slave_fd)
-
-            # Set TERM
-            os.environ["TERM"] = "xterm-256color"
-
-            # Exec shell
-            os.execlp(shell, shell, "--login")
-        else:
-            # Parent process
-            os.close(self.fd)  # Close slave side in parent
-            self.fd = self.pid  # Master fd
-            self.pid = child_pid
-
-            # Set master to non-blocking
-            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
-            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-            self._running = True
-            self._read_task = asyncio.create_task(self._read_loop())
-            logger.info(f"[PTY] Session {self.session_id} started, pid={self.pid}, shell={shell}")
+        self._running = True
+        # Register on the event loop directly — no executor thread per session.
+        loop = asyncio.get_event_loop()
+        loop.add_reader(self.fd, self._on_readable)
+        self._reader_registered = True
+        logger.info(f"[PTY] Session {self.session_id} started, pid={self.pid}, shell={shell}")
 
     async def write(self, data: str):
         """Write input data to the PTY."""
@@ -111,81 +116,82 @@ class PtySession:
         except Exception as e:
             logger.debug(f"[PTY] Set size error: {e}")
 
-    async def _read_loop(self):
-        """Background loop that reads PTY output and sends via WebSocket."""
-        loop = asyncio.get_event_loop()
+    def _on_readable(self):
+        """Called by the event loop when the master fd has data."""
+        if not self._running or self.fd is None:
+            return
         try:
-            while self._running:
-                # Wait for data to be available
-                try:
-                    readable, _, _ = await loop.run_in_executor(
-                        None,
-                        lambda: select.select([self.fd], [], [], 0.1)
-                    )
-                except (ValueError, OSError):
-                    break
+            data = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
 
-                if readable:
-                    try:
-                        data = os.read(self.fd, 4096)
-                        if not data:
-                            break
-                        # Send output back through WebSocket
-                        await self.ws.send(
-                            __import__("json").dumps({
-                                "type": "pty_output",
-                                "session_id": self.session_id,
-                                "data": data.decode("utf-8", errors="replace"),
-                            })
-                        )
-                    except OSError:
-                        break
-                    except Exception as e:
-                        logger.warning(f"[PTY] Read/send error: {e}")
-                        break
-        except asyncio.CancelledError:
-            pass
-        finally:
-            logger.info(f"[PTY] Read loop ended for session {self.session_id}")
-            # Notify platform the PTY closed
-            try:
-                await self.ws.send(
-                    __import__("json").dumps({
-                        "type": "pty_closed",
-                        "session_id": self.session_id,
-                    })
-                )
-            except Exception:
-                pass
+        if not data:
+            # EOF — shell exited. Schedule cleanup on the loop.
+            asyncio.create_task(self._on_eof())
+            return
 
-    async def stop(self):
-        """Stop the PTY session and kill the shell process."""
+        try:
+            asyncio.create_task(self.ws.send(json.dumps({
+                "type": "pty_output",
+                "session_id": self.session_id,
+                "data": data.decode("utf-8", errors="replace"),
+            })))
+        except Exception as e:
+            logger.warning(f"[PTY] send error: {e}")
+
+    async def _on_eof(self):
+        if not self._running:
+            return
+        logger.info(f"[PTY] EOF on session {self.session_id}")
+        await self.stop(notify=True)
+
+    async def stop(self, notify: bool = True):
+        """Stop the PTY session and reap the shell process."""
+        if not self._running and self.fd is None and self.pid is None:
+            return
         self._running = False
 
-        if self._read_task:
-            self._read_task.cancel()
+        loop = asyncio.get_event_loop()
+        if self._reader_registered and self.fd is not None:
             try:
-                await self._read_task
-            except asyncio.CancelledError:
+                loop.remove_reader(self.fd)
+            except (ValueError, OSError):
                 pass
+            self._reader_registered = False
 
         if self.pid:
             try:
                 os.kill(self.pid, signal.SIGTERM)
-                # Wait briefly, then force kill
-                await asyncio.sleep(0.5)
-                try:
-                    os.kill(self.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                os.waitpid(self.pid, os.WNOHANG)
-            except (ProcessLookupError, ChildProcessError):
+            except ProcessLookupError:
                 pass
+            # Give the shell a moment to clean up.
+            await asyncio.sleep(0.3)
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+            self.pid = None
 
         if self.fd is not None:
             try:
                 os.close(self.fd)
             except OSError:
+                pass
+            self.fd = None
+
+        if notify:
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "pty_closed",
+                    "session_id": self.session_id,
+                }))
+            except Exception:
                 pass
 
         logger.info(f"[PTY] Session {self.session_id} stopped")
