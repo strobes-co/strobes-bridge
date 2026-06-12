@@ -13,6 +13,8 @@ dependencies = [
     "websockets>=12.0",
     "click>=8.0",
     "python-dotenv>=1.0",
+    # Windows interactive terminal (ConPTY). No-op marker on other OSes.
+    "pywinpty>=2.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

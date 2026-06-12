@@ -1,7 +1,14 @@
 """Interactive PTY handler for the shell bridge agent.
 
-Opens a local pseudo-terminal (bash/zsh) and streams I/O
-back through the WebSocket to the Strobes platform.
+Opens a local pseudo-terminal and streams I/O back through the WebSocket
+to the Strobes platform.
+
+Two backends, selected at runtime:
+  * POSIX  — ``pty.openpty()`` + ``os.fork()`` running bash/zsh/sh.
+  * Windows — ConPTY via the ``pywinpty`` package, running
+    PowerShell/cmd. Requires ``pip install pywinpty`` (declared as a
+    Windows-only extra in pyproject.toml). If pywinpty is missing we
+    return a clear, actionable error instead of silently failing.
 """
 
 import asyncio
@@ -18,15 +25,23 @@ if not IS_WINDOWS:
     import signal
     import struct
     import termios
+else:
+    # pywinpty is imported lazily in the Windows session so the agent
+    # still starts (and command execution still works) on a Windows box
+    # that hasn't installed the optional dependency yet.
+    try:
+        import winpty  # type: ignore
+    except Exception:  # pragma: no cover - exercised only on Windows
+        winpty = None
 
 logger = logging.getLogger(__name__)
 
-# Active PTY sessions: session_id -> PtySession
+# Active PTY sessions: session_id -> session object
 _sessions = {}
 
 
 class PtySession:
-    """Manages a single PTY subprocess."""
+    """Manages a single POSIX PTY subprocess."""
 
     def __init__(self, session_id: str, ws, shell: str = "/bin/bash"):
         self.session_id = session_id
@@ -197,18 +212,145 @@ class PtySession:
         logger.info(f"[PTY] Session {self.session_id} stopped")
 
 
+class WindowsPtySession:
+    """Manages a single Windows ConPTY subprocess via pywinpty.
+
+    pywinpty's API is blocking, so output is drained on a dedicated
+    executor thread and handed back to the asyncio loop with
+    ``call_soon_threadsafe``. Input/resize/terminate are quick and run
+    inline.
+    """
+
+    def __init__(self, session_id: str, ws, shell: str = ""):
+        self.session_id = session_id
+        self.ws = ws
+        self.shell = shell
+        self.proc = None
+        self._running = False
+        self._loop = None
+        self._reader_future = None
+
+    def _pick_shell(self) -> str:
+        if self.shell:
+            return self.shell
+        # Prefer PowerShell, fall back to cmd.exe via COMSPEC.
+        import shutil
+        for candidate in ("powershell.exe", "pwsh.exe"):
+            found = shutil.which(candidate)
+            if found:
+                return found
+        return os.environ.get("COMSPEC", "cmd.exe")
+
+    async def start(self, cols: int = 80, rows: int = 24):
+        if winpty is None:
+            raise RuntimeError(
+                "pywinpty is not installed. Install it on the target machine "
+                "with 'pip install pywinpty' (or reinstall the shell agent with "
+                "the [windows] extra) to enable the interactive terminal."
+            )
+
+        shell = self._pick_shell()
+        self._loop = asyncio.get_event_loop()
+        # pywinpty takes (rows, cols) as dimensions.
+        self.proc = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols))
+        self._running = True
+        # Drain output on a thread; pywinpty reads are blocking.
+        self._reader_future = self._loop.run_in_executor(None, self._reader_loop)
+        logger.info(
+            f"[PTY] Windows session {self.session_id} started, shell={shell}"
+        )
+
+    def _reader_loop(self):
+        """Blocking read loop, runs on an executor thread."""
+        while self._running and self.proc is not None:
+            try:
+                data = self.proc.read(4096)
+            except EOFError:
+                break
+            except Exception as e:  # process died / pipe closed
+                logger.debug(f"[PTY] Windows read error: {e}")
+                break
+            if not data:
+                # isalive() False means the shell exited.
+                if not self.proc.isalive():
+                    break
+                continue
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._dispatch_output, data)
+
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._dispatch_eof)
+
+    def _dispatch_output(self, data: str):
+        if not self._running:
+            return
+        try:
+            asyncio.create_task(self.ws.send(json.dumps({
+                "type": "pty_output",
+                "session_id": self.session_id,
+                "data": data,
+            })))
+        except Exception as e:
+            logger.warning(f"[PTY] send error: {e}")
+
+    def _dispatch_eof(self):
+        if not self._running:
+            return
+        logger.info(f"[PTY] EOF on Windows session {self.session_id}")
+        asyncio.create_task(self.stop(notify=True))
+
+    async def write(self, data: str):
+        if self.proc is not None and self._running:
+            try:
+                self.proc.write(data)
+            except Exception as e:
+                logger.warning(f"[PTY] Windows write error: {e}")
+                await self.stop()
+
+    def resize(self, cols: int, rows: int):
+        if self.proc is not None:
+            try:
+                self.proc.setwinsize(rows, cols)
+            except Exception as e:
+                logger.debug(f"[PTY] Windows set size error: {e}")
+
+    async def stop(self, notify: bool = True):
+        if not self._running and self.proc is None:
+            return
+        self._running = False
+
+        if self.proc is not None:
+            try:
+                self.proc.terminate(force=True)
+            except Exception:
+                pass
+            self.proc = None
+
+        if notify:
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "pty_closed",
+                    "session_id": self.session_id,
+                }))
+            except Exception:
+                pass
+
+        logger.info(f"[PTY] Windows session {self.session_id} stopped")
+
+
+def _new_session(session_id: str, ws):
+    """Factory: pick the right PTY backend for this platform."""
+    if IS_WINDOWS:
+        return WindowsPtySession(session_id, ws)
+    return PtySession(session_id, ws)
+
+
 async def handle_pty_open(ws, session_id: str, cols: int = 80, rows: int = 24) -> dict:
     """Open a new PTY session."""
-    if IS_WINDOWS:
-        return {
-            "success": False,
-            "error": "Interactive PTY sessions are not supported on Windows.",
-        }
-
     if session_id in _sessions:
         await _sessions[session_id].stop()
 
-    session = PtySession(session_id, ws)
+    session = _new_session(session_id, ws)
     _sessions[session_id] = session
 
     try:
@@ -216,6 +358,7 @@ async def handle_pty_open(ws, session_id: str, cols: int = 80, rows: int = 24) -
         return {"success": True, "session_id": session_id}
     except Exception as e:
         _sessions.pop(session_id, None)
+        logger.error(f"[PTY] Failed to open session {session_id}: {e}")
         return {"success": False, "error": str(e)}
 
 
