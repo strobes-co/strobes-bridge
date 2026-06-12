@@ -14,6 +14,19 @@ from strobes_shell_agent.client import ShellBridgeClient
 from strobes_shell_agent import service as svc
 
 
+# Windows consoles often default to a legacy code page (e.g. cp1252) that
+# cannot encode characters used in help text/logs, which makes `--help`
+# crash with UnicodeEncodeError. Force UTF-8 at import time, before click
+# renders anything. Guarded because stdout/stderr may be None or
+# non-reconfigurable (frozen/windowed builds).
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
+
 def setup_logging(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -173,9 +186,9 @@ def install_service(url, api_key, org_id, bridge_id, name, cwd, ssl_verify, scop
     """Register the agent as a system service that starts on boot.
 
     \b
-    Linux  → systemd unit at ~/.config/systemd/user/co.strobes.shell-agent.service
+    Linux  -> systemd unit at ~/.config/systemd/user/co.strobes.shell-agent.service
              (or /etc/systemd/system/ when run as root)
-    macOS  → launchd LaunchAgent at ~/Library/LaunchAgents/co.strobes.shell-agent.plist
+    macOS  -> launchd LaunchAgent at ~/Library/LaunchAgents/co.strobes.shell-agent.plist
     """
     if not bridge_id:
         bridge_id = get_or_create_bridge_id()
