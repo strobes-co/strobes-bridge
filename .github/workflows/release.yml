@@ -22,10 +22,14 @@ jobs:
         include:
           - os: ubuntu-latest
             asset_name: strobes-shell-agent-linux-amd64
+            extra_args: ""
           - os: macos-latest
             asset_name: strobes-shell-agent-macos-arm64
+            extra_args: ""
           - os: windows-latest
             asset_name: strobes-shell-agent-windows-amd64.exe
+            # Bundle pywinpty's native ConPTY DLLs for the interactive terminal.
+            extra_args: "--collect-all winpty"
 
     runs-on: ${{ matrix.os }}
 
@@ -48,6 +52,8 @@ jobs:
             --hidden-import=strobes_shell_agent.executor \
             --hidden-import=strobes_shell_agent.client \
             --hidden-import=strobes_shell_agent.config \
+            --hidden-import=strobes_shell_agent.pty_handler \
+            ${{ matrix.extra_args }} \
             strobes_shell_agent/__main__.py
         shell: bash
 
