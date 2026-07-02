@@ -201,17 +201,20 @@ def _extract(arc: Path, kind: str, dest: Path) -> None:
             t.extractall(dest)
 
 
-def download_tools(manifest: Path, pack: Path, os_name: str, arch: str) -> tuple[dict, dict]:
-    """Download + install CLI tools for (os,arch). Returns (lock, env) where lock maps
-    tool -> {version, sha256, binary, …} and env maps runtime var -> pack-relative path
-    (e.g. NMAPDIR). Single-binary tools land in bin/; 'bundle' tools extract to
-    share/<dir>/ with their binaries linked into bin/."""
+def download_tools(manifest: Path, pack: Path, os_name: str,
+                   arch: str) -> tuple[dict, dict, list]:
+    """Download + install CLI tools for (os,arch). Returns (lock, env, bin_dirs):
+    lock maps tool -> {version, sha256, binary, …}; env maps runtime var -> pack-relative
+    path (e.g. NMAPDIR); bin_dirs are extra pack-relative dirs to prepend to PATH (used by
+    'path'-exposed bundles like Windows nmap whose binary needs its adjacent DLLs).
+    Single-binary tools land in bin/; 'bundle' tools extract to share/<dir>/."""
     spec = json.loads(manifest.read_text())
     bindir = pack / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
     arch_default = spec.get("arch_map_default", {})
     lock: dict = {}
     env: dict = {}
+    bin_dirs: list = []
     exe = ".exe" if os_name == "windows" else ""
     for tool in spec["tools"]:
         name = tool["name"]
@@ -237,8 +240,13 @@ def download_tools(manifest: Path, pack: Path, os_name: str, arch: str) -> tuple
                 print(f"  - {name}: {url}")
                 urllib.request.urlretrieve(url, arc)  # noqa: S310 (trusted release URLs)
 
-                if tool.get("kind") == "bundle":
-                    lock[name] = _install_bundle(tool, arc, pack, bindir, exe, url, env)
+                kind = tool.get("kind")
+                if kind == "bundle":
+                    lock[name] = _install_bundle(tool, arc, pack, bindir, exe, url,
+                                                 env, bin_dirs)
+                elif kind == "dmg":
+                    lock[name] = _install_dmg(tool, arc, pack, bindir, exe, url,
+                                              env, bin_dirs)
                 else:
                     _extract(arc, archive, tmp)
                     binname = tool["binary"] + exe
@@ -255,13 +263,12 @@ def download_tools(manifest: Path, pack: Path, os_name: str, arch: str) -> tuple
                     print(f"    ok {binname} sha256={digest[:16]}…")
         except Exception as e:  # noqa: BLE001 — one tool failing must not fail the pack
             print(f"    ! {name} failed: {e}")
-    return lock, env
+    return lock, env, bin_dirs
 
 
 def _install_bundle(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
-                    url: str, env: dict) -> dict:
-    """Extract a bundle tool (binary + data dir) into share/<bundle_dir>/, link its
-    binaries into bin/, and register its runtime env (e.g. NMAPDIR)."""
+                    url: str, env: dict, bin_dirs: list) -> dict:
+    """Extract an archive bundle (binary + data) into share/<bundle_dir>/, then finalize."""
     share = pack / "share" / tool["bundle_dir"]
     if share.exists():
         shutil.rmtree(share)
@@ -274,21 +281,85 @@ def _install_bundle(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
         for item in list(inner.iterdir()):
             shutil.move(str(item), str(share / item.name))
         inner.rmdir()
+    return _finalize_bundle(tool, share, pack, bindir, exe, url, env, bin_dirs)
 
-    linked = []
-    for b in tool.get("binaries", [tool.get("primary", tool["name"])]):
-        bname = b + exe
-        target = share / bname
-        if not target.exists():
-            print(f"    ! bundle binary '{bname}' missing, skipping link")
-            continue
-        target.chmod(0o755)
-        link = bindir / bname
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        # relative symlink so the pack stays relocatable
-        link.symlink_to(os.path.relpath(target, bindir))
-        linked.append(bname)
+
+def _install_dmg(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
+                 url: str, env: dict, bin_dirs: list) -> dict:
+    """macOS only: mount a .dmg installer, expand its .mpkg, extract the component
+    payloads, and assemble share/<bundle_dir>/ = {binaries at root, data/ subdir}.
+    Used for nmap, which upstream ships only as a .dmg on macOS. The extracted nmap is
+    x86_64 (runs natively on Intel, via Rosetta 2 on Apple Silicon) and statically links
+    everything but libSystem/libc++, so it's self-contained."""
+    share = pack / "share" / tool["bundle_dir"]
+    if share.exists():
+        shutil.rmtree(share)
+    share.mkdir(parents=True)
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        mnt = tdp / "mnt"
+        mnt.mkdir()
+        run(["hdiutil", "attach", "-nobrowse", "-readonly",
+             "-mountpoint", str(mnt), str(arc)], capture_output=True)
+        try:
+            mpkg = next(mnt.glob("*.mpkg"))
+            exp = tdp / "exp"
+            run(["pkgutil", "--expand", str(mpkg), str(exp)], capture_output=True)
+            root = tdp / "root"
+            root.mkdir()
+            for comp in tool.get("components", [tool.get("primary", tool["name"])]):
+                payload = exp / f"{comp}.pkg" / "Payload"
+                if payload.exists():
+                    subprocess.run(f'cat "{payload}" | gzip -dc | cpio -id',
+                                   cwd=root, shell=True, capture_output=True)
+            # data dir (nmap-services etc.) -> share/<dir>/data
+            data_src = root / tool.get("data_from", f"share/{tool['bundle_dir']}")
+            shutil.copytree(data_src, share / "data")
+            # binaries -> share/<dir>/
+            for b in tool.get("binaries", [tool.get("primary", tool["name"])]):
+                src = root / "bin" / b
+                if src.exists():
+                    dst = share / b
+                    shutil.copy2(src, dst)
+                    dst.chmod(0o755)
+        finally:
+            subprocess.run(["hdiutil", "detach", str(mnt)], capture_output=True)
+    return _finalize_bundle(tool, share, pack, bindir, exe, url, env, bin_dirs)
+
+
+def _finalize_bundle(tool: dict, share: Path, pack: Path, bindir: Path, exe: str,
+                     url: str, env: dict, bin_dirs: list) -> dict:
+    """Expose a prepared share/<bundle_dir>/ and register its runtime env:
+      - expose 'link' (default): relative-symlink/copy each binary into bin/. Good for
+        self-contained binaries (Linux musl / macOS static nmap) that find data via env.
+      - expose 'path': add share/<bundle_dir> to PATH. Needed when the binary depends on
+        adjacent files (Windows nmap.exe + its DLLs)."""
+    binaries = tool.get("binaries", [tool.get("primary", tool["name"])])
+    expose = tool.get("expose", "link")
+    exposed = []
+    if expose == "path":
+        bin_dirs.append(os.path.relpath(share, pack).replace(os.sep, "/"))
+        for b in binaries:
+            t = share / (b + exe)
+            if t.exists():
+                t.chmod(0o755)
+                exposed.append(b + exe)
+    else:  # link
+        for b in binaries:
+            bname = b + exe
+            target = share / bname
+            if not target.exists():
+                print(f"    ! bundle binary '{bname}' missing, skipping")
+                continue
+            target.chmod(0o755)
+            link = bindir / bname
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            try:  # relative symlink keeps the pack relocatable
+                link.symlink_to(os.path.relpath(target, bindir))
+            except (OSError, NotImplementedError):  # e.g. Windows w/o privilege
+                shutil.copy2(target, link)
+            exposed.append(bname)
 
     for var, rel in (tool.get("env") or {}).items():
         env[var] = rel  # pack-relative; resolved to absolute at runtime by pack.build_env
@@ -296,10 +367,10 @@ def _install_bundle(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
     primary = tool.get("primary", tool["name"]) + exe
     digest = sha256_file(share / primary)
     print(f"    ok bundle {tool['name']} -> share/{tool['bundle_dir']} "
-          f"(bin: {', '.join(linked)}) sha256={digest[:16]}…")
+          f"(expose={expose}: {', '.join(exposed)}) sha256={digest[:16]}…")
     return {"version": tool["version"], "sha256": digest, "url": url,
             "binary": primary, "kind": "bundle", "bundle_dir": tool["bundle_dir"],
-            "binaries": linked, "env": tool.get("env") or {}}
+            "expose": expose, "binaries": exposed, "env": tool.get("env") or {}}
 
 
 def pip_freeze(uv: str, pybin: Path) -> list[str]:
@@ -339,10 +410,11 @@ def main() -> int:
     lockfile = install_packages(uv, pybin, Path(args.requirements), pack, triple)
     relocate_fixup(pack, pybin)
 
-    tools_lock, tools_env = {}, {}
+    tools_lock, tools_env, tools_bin_dirs = {}, {}, []
     if not args.no_tools:
         print("[4/5] downloading CLI tools …")
-        tools_lock, tools_env = download_tools(Path(args.manifest), pack, os_name, arch)
+        tools_lock, tools_env, tools_bin_dirs = download_tools(
+            Path(args.manifest), pack, os_name, arch)
         (pack / "tools.lock.json").write_text(json.dumps(tools_lock, indent=2))
     else:
         print("[4/5] skipping CLI tools (--no-tools)")
@@ -359,7 +431,8 @@ def main() -> int:
         "python_lock": lockfile.name,
         "packages": pip_freeze(uv, pybin),
         "tools": tools_lock,
-        "env": tools_env,   # runtime env vars (pack-relative), e.g. {"NMAPDIR": "share/nmap/data"}
+        "env": tools_env,        # runtime env vars (pack-relative), e.g. {"NMAPDIR": "..."}
+        "bin_dirs": tools_bin_dirs,  # extra PATH dirs (pack-relative), e.g. Windows nmap dir
     }
     (pack / "pack.manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"      packages: {len(manifest['packages'])}  tools: {len(tools_lock)}")

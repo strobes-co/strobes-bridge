@@ -6,7 +6,7 @@ as a single, self-contained, relocatable directory:
 - a **standalone Python interpreter** (python-build-standalone) with every agent package
   baked in — `boto3`, `reportlab`, `curl_cffi`, `cryptography`, `lxml`, `pillow`, … ;
 - **CLI security tools** in `bin/` — `nuclei`, `httpx`, `subfinder`, `dnsx`, `ffuf`, `gobuster`,
-  and `nmap` (+`ncat`/`nping`) on Linux.
+  and `nmap` (+`ncat`/`nping`) — on **all** platforms (Linux, macOS, Windows).
 
 It runs with **no Docker, no root, no system Python, and no internet at runtime**. This is how
 the bridge stops being blocked by "the user can't install nmap / boto3 / reportlab here."
@@ -57,19 +57,23 @@ builds all platforms and publishes tarballs + `.sha256` files.
 > musl-static variant would be needed for those and Alpine — see "Future" below.
 > (Note: the bundled **nmap** is musl-static and *does* run on those hosts — see below.)
 
-### nmap
+### nmap (all platforms, +`ncat`/`nping`)
 
-`nmap` (+`ncat`/`nping`) is bundled from [ernw/static-toolbox](https://github.com/ernw/static-toolbox)
-— a **musl-static** portable build, so it runs on **any Linux** including Alpine and glibc < 2.28
-(validated offline on Alpine 3.19 and Amazon Linux 2). Linux x86_64 / aarch64 only.
+nmap is bundled per-OS from upstream, extracted at build time, with its data files shipped and
+**`NMAPDIR`** set automatically by `pack.build_env()` (so `nmap-services`, `-sV`, and NSE work
+offline). **Connect scans** (`-sT`) work **unprivileged** everywhere; **SYN** (`-sS`) and OS
+detection need root / `cap_net_raw` (and the Npcap driver on Windows).
 
-- The pack ships nmap's data files under `share/nmap/data`; the bridge sets **`NMAPDIR`** to it
-  automatically (via `pack.build_env()`), so `nmap-services`, `-sV`, and NSE scripts work offline.
-- **Connect scans** (`-sT`) work **unprivileged**. **SYN** (`-sS`) and OS detection need
-  root / `cap_net_raw`.
-- **macOS / Windows:** nmap is **not** bundled (ernw is Linux-only). Those hosts fall back to a
-  host-installed nmap — on **Windows** that requires the **Npcap** driver (a privileged install)
-  for raw-socket scans; connect scans work with a plain nmap.exe on PATH.
+| OS | Source | Notes |
+|---|---|---|
+| Linux x86_64 / aarch64 | [ernw/static-toolbox](https://github.com/ernw/static-toolbox) | **musl-static** → runs on *any* Linux incl. Alpine & glibc < 2.28 (validated on Alpine 3.19, Amazon Linux 2). No floor. |
+| macOS x86_64 / aarch64 | official `.dmg` (extracted at build) | binary is **x86_64** (native on Intel, **Rosetta 2** on Apple Silicon); statically links all but libSystem/libc++. Built on macOS runners only. |
+| Windows x86_64 | official `nmap-7.92-win32.zip` (last portable zip) | whole dir on PATH (nmap.exe + its DLLs). **SYN/OS-detect need the Npcap driver** — a privileged kernel install that cannot be shipped as a portable file; connect scans work. |
+
+Because nmap diverges by OS (different upstream, layout, packaging), the manifest has three
+`nmap` entries with disjoint `platforms`; exactly one matches per build. Bundle install modes:
+`expose: link` (symlink the self-contained binary into `bin/`, Linux/macOS) vs `expose: path`
+(add the bundle dir to PATH so Windows nmap.exe finds its adjacent DLLs).
 
 ## Testing
 

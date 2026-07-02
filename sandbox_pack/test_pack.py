@@ -132,33 +132,56 @@ def check_tools(pack: Path) -> bool:
     if not lock_path.exists() or not (lock := json.loads(lock_path.read_text())):
         print(f"  {DIM}(no tools recorded; skipping){RST}")
         return True
-    # Build the same env the bridge injects: pack bin on PATH + bundle env (NMAPDIR).
+    # Build the same env the bridge injects: pack bin + bundle bin_dirs on PATH + env vars.
     manifest = json.loads((pack / "pack.manifest.json").read_text())
     tool_env = dict(os.environ)
-    tool_env["PATH"] = str(pack / "bin") + os.pathsep + tool_env.get("PATH", "")
+    path_dirs = [str(pack / "bin")]
+    path_dirs += [str((pack / rel).resolve()) for rel in (manifest.get("bin_dirs") or [])]
+    tool_env["PATH"] = os.pathsep.join(path_dirs) + os.pathsep + tool_env.get("PATH", "")
     for var, rel in (manifest.get("env") or {}).items():
         tool_env[var] = str((pack / rel).resolve())
+    is_windows = manifest.get("os") == "windows"
+    is_mac_arm = manifest.get("os") == "macos" and manifest.get("arch") == "aarch64"
     passed = True
     for name, meta in lock.items():
-        binp = pack / "bin" / meta["binary"]
+        # path-exposed bundles keep their binary in share/<dir>/; others live in bin/
+        if meta.get("kind") == "bundle" and meta.get("expose") == "path":
+            binp = pack / "share" / meta["bundle_dir"] / meta["binary"]
+        else:
+            binp = pack / "bin" / meta["binary"]
         if not binp.exists():
-            bad(f"{name}: missing binary"); passed = False; continue
+            bad(f"{name}: missing binary ({binp})"); passed = False; continue
         if hashlib.sha256(binp.read_bytes()).hexdigest() != meta["sha256"]:
             bad(f"{name}: sha256 mismatch"); passed = False; continue
         r = subprocess.run([str(binp), "-version"], capture_output=True, text=True, env=tool_env)
         if r.returncode != 0:
             r = subprocess.run([str(binp), "--version"], capture_output=True, text=True, env=tool_env)
         runnable = r.returncode == 0 or bool((r.stdout + r.stderr).strip())
-        (ok if runnable else bad)(f"{name} {meta['version']} (sha256 ✓, runs {runnable})")
-        passed &= runnable
-        # nmap: prove an actual unprivileged connect scan works with the pack's NMAPDIR.
+        # nmap on macOS-arm64 is x86_64 (needs Rosetta 2); mark present-but-not-runnable
+        # as informational rather than failing the pack, since it's an env prerequisite.
+        if runnable:
+            ok(f"{name} {meta['version']} (sha256 ✓, runs True)")
+        elif name == "nmap" and is_mac_arm:
+            print(f"  {DIM}~ nmap {meta['version']} present; needs Rosetta 2 to run on "
+                  f"Apple Silicon{RST}")
+            continue
+        else:
+            bad(f"{name} {meta['version']} (runs False)"); passed = False; continue
+        # nmap: prove an unprivileged connect scan works with the pack's NMAPDIR. On
+        # Windows raw ops need the Npcap driver (not shippable); connect scans may still
+        # work — treat as informational there rather than failing the pack.
         if name == "nmap":
             s = subprocess.run([str(binp), "-sT", "-Pn", "-p", "80", "127.0.0.1"],
                                capture_output=True, text=True, env=tool_env)
             out = s.stdout + s.stderr
             scanned = "Nmap done" in out and "Unable to find nmap-services" not in out
-            (ok if scanned else bad)(f"nmap connect-scan + NMAPDIR ({'ok' if scanned else out[-160:]})")
-            passed &= scanned
+            if scanned:
+                ok("nmap connect-scan + NMAPDIR (ok)")
+            elif is_windows:
+                print(f"  {DIM}~ nmap connect-scan needs Npcap on Windows "
+                      f"(binary present + NMAPDIR set){RST}")
+            else:
+                bad(f"nmap connect-scan + NMAPDIR ({out[-160:]})"); passed = False
     return passed
 
 

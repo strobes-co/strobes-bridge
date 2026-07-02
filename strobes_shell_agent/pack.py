@@ -117,6 +117,11 @@ def _path_prefix() -> str:
     b = pack_bin()
     if b:
         parts.append(str(b))
+    pack = find_pack()
+    if pack:
+        # extra dirs from 'path'-exposed bundles (e.g. Windows nmap dir with its DLLs)
+        for rel in (_manifest(pack).get("bin_dirs") or []):
+            parts.append(str((pack / rel).resolve()))
     py = pack_python()
     if py:
         parts.append(str(py.parent))          # POSIX: .../bin ; Windows: interpreter root
