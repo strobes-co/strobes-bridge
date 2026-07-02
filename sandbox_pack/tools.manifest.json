@@ -47,8 +47,9 @@
       "name": "ffuf",
       "version": "2.1.0",
       "archive": "tar.gz",
+      "archive_map": { "windows": "zip" },
       "binary": "ffuf",
-      "url": "https://github.com/ffuf/ffuf/releases/download/v{version}/ffuf_{version}_{os}_{arch}.tar.gz",
+      "url": "https://github.com/ffuf/ffuf/releases/download/v{version}/ffuf_{version}_{os}_{arch}.{ext}",
       "os_map": { "linux": "linux", "macos": "macos", "windows": "windows" },
       "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
     },

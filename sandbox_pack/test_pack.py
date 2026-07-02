@@ -28,6 +28,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Windows cp1252 consoles can't encode the ✓/✗ used below; force UTF-8 where possible.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 IMPORTS = {
     "baseline": ["boto3", "botocore", "requests", "paramiko", "urllib3", "certifi", "yaml"],
     "native": ["curl_cffi", "cryptography", "lxml.etree", "PIL", "zstandard"],

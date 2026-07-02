@@ -38,6 +38,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Windows consoles default to a legacy code page (cp1252) that can't encode the ✓/✅/…
+# used in progress output, which crashes the build. Force UTF-8 stdio where possible.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 HERE = Path(__file__).resolve().parent
 
 
@@ -211,25 +219,28 @@ def download_tools(manifest: Path, pack: Path, os_name: str, arch: str) -> tuple
         if plats and f"{os_name}/{arch}" not in plats:
             print(f"  - {name}: no build for {os_name}/{arch}, skipping")
             continue
+        # some tools change container format per-OS (e.g. ffuf ships .zip on Windows)
+        archive = tool.get("archive_map", {}).get(os_name, tool["archive"])
         toks = {
             "version": tool["version"],
             "os": tool.get("os_map", spec.get("os_map_default", {})).get(os_name, os_name),
             "arch": tool.get("arch_map", arch_default).get(arch, arch),
             "arch2": {"x86_64": "x86_64", "aarch64": "arm64"}.get(arch, arch),
             "arch3": tool.get("arch3", {}).get(arch, arch),
+            "ext": archive,   # container extension (tar.gz / zip), per-OS
         }
         url = render(tool["url"], **toks)
         try:
             with tempfile.TemporaryDirectory() as td:
                 tmp = Path(td)
-                arc = tmp / f"{name}.{tool['archive']}"
+                arc = tmp / f"{name}.{archive}"
                 print(f"  - {name}: {url}")
                 urllib.request.urlretrieve(url, arc)  # noqa: S310 (trusted release URLs)
 
                 if tool.get("kind") == "bundle":
                     lock[name] = _install_bundle(tool, arc, pack, bindir, exe, url, env)
                 else:
-                    _extract(arc, tool["archive"], tmp)
+                    _extract(arc, archive, tmp)
                     binname = tool["binary"] + exe
                     found = next((p for p in tmp.rglob(binname) if p.is_file()), None)
                     if not found:
