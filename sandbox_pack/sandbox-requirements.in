@@ -1,0 +1,42 @@
+# Strobes Sandbox Pack — Python dependency surface (Tier 1: network/CLI pentest + reporting)
+#
+# Single source of truth for the Python packages the pack ships. It mirrors what the
+# Strobes cloud (Bedrock) sandbox installs lazily at runtime (import X -> pip install X),
+# so a bridge host can run the same agent code OFFLINE with NO Docker, NO root, and NO
+# system Python. Derived from an audit of the platform's execution-environment install/
+# import sites (precheck, session_manager, http_tools, and the *-creator skills).
+#
+# Tiering:
+#   Tier 1 (this file)  -> network/CLI pentest + report generation. No browser. Ships everywhere.
+#   Tier 2 (browser)    -> playwright + Chromium + its .so closure. Separate, heavier pack.
+#   Tier 3 (specialist) -> frida-tools, z3-solver, sliver-py, mythic, apk toolchain. Opt-in.
+#
+# Pins are loose (>=); build_pack.py compiles a fully-pinned, hashed lock per platform.
+
+# --- baseline: needed for essentially every agent run ---
+boto3>=1.34            # S3 workspace/artifact sync (pure-python)
+botocore>=1.34
+requests>=2.31         # ubiquitous in skill scripts (pure-python)
+paramiko>=3.4          # SSH shell path (pure-python; pulls cryptography)
+urllib3>=2.0
+certifi>=2024.2.2
+
+# --- native wheels (arch-specific; prebuilt wheels exist on PyPI for all targets) ---
+curl_cffi>=0.7         # canonical HTTP path w/ browser-impersonation (libcurl-impersonate)
+cryptography>=42.0     # Fernet cred decrypt + jwt tooling (Rust/OpenSSL)
+lxml>=5.1              # skill scripts + python-docx/pptx dep (libxml2/libxslt)
+zstandard>=0.22        # artifact/tarball handling (C)
+
+# --- report / document generation (pdf/docx/pptx creator skills) ---
+reportlab>=4.1
+pypdf>=4.0
+pdfplumber>=0.11       # pulls pdfminer.six
+pillow>=10.2           # imaging (native)
+python-docx>=1.1
+python-pptx>=0.6.23
+defusedxml>=0.7
+
+# --- common skill-script helpers (pure-python, cheap to include in Tier 1) ---
+PyYAML>=6.0
+chardet>=5.2
+h2>=4.1

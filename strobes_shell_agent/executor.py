@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from strobes_shell_agent import pack
+
 IS_WINDOWS = sys.platform == "win32"
 
 
@@ -31,6 +33,9 @@ async def execute_shell_command(
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.PIPE,
         "cwd": cwd,
+        # Prepend the sandbox pack (CLI tools + standalone python) to PATH so the
+        # agent's nmap/nuclei/python etc. resolve to the pack. No-op if no pack.
+        "env": pack.build_env(),
     }
     # New process group / job — lets us kill the whole tree on timeout.
     if IS_WINDOWS:
@@ -111,7 +116,9 @@ async def execute_code(
 
     if lang in ("python", "python3"):
         suffix = ".py"
-        interpreter = "python3"
+        # Use the pack's standalone interpreter (has boto3/reportlab/curl_cffi/… baked
+        # in) when a pack is present; otherwise fall back to the host's python3.
+        interpreter = shlex.quote(pack.python_interpreter())
     elif lang in ("node", "javascript", "js"):
         suffix = ".js"
         interpreter = "node"
@@ -287,11 +294,13 @@ def get_env_info() -> dict:
         "user": os.environ.get("USER", os.environ.get("USERNAME", "unknown")),
     }
 
-    # Check for common tools
+    # Check for common tools, honouring the sandbox pack's bin/ dir if present.
+    env_path = pack.build_env().get("PATH")
     tools = {}
     for tool in ["python3", "node", "npm", "git", "docker", "nmap", "curl", "wget",
                  "nuclei", "httpx", "subfinder", "ffuf", "gobuster"]:
-        tools[tool] = shutil.which(tool) is not None
+        tools[tool] = shutil.which(tool, path=env_path) is not None
     info["tools"] = tools
+    info["pack"] = pack.status()
 
     return {"success": True, **info}
