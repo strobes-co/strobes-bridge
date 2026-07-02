@@ -108,7 +108,9 @@ jobs:
   publish:
     needs: [linux, native]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/pack-v')
+    # Publish whatever packs built. !cancelled() lets a slow/failed leg (e.g. the scarce
+    # Intel-mac runner) not sink the release; re-running that job later re-publishes it.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/pack-v') }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -121,6 +123,14 @@ jobs:
           ls -la
       - uses: softprops/action-gh-release@v2
         with:
+          name: Sandbox packs ${{ github.ref_name }}
+          body: |
+            Self-contained bridge sandbox packs (standalone Python + agent packages +
+            CLI tools: nmap, nuclei, httpx, ffuf, gobuster, subfinder, dnsx).
+
+            The bridge auto-downloads the pack for its OS/arch on startup via
+            `STROBES_PACK_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}`.
+            Each `*.tar.gz` has a matching `*.sha256` for integrity verification.
           files: |
             dist/*.tar.gz
             dist/*.sha256
