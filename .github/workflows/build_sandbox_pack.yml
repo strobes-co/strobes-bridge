@@ -1,0 +1,118 @@
+name: Build Sandbox Packs
+
+# Builds the self-contained "sandbox pack" (standalone Python runtime + agent packages +
+# CLI security tools) for each platform and publishes the tarballs + a checksums file.
+# Linux packs are built inside manylinux_2_28 containers so they run on glibc >= 2.28
+# (RHEL/Rocky 8+, Ubuntu 20.04+, Debian 10+, Amazon Linux 2023).
+#
+# Trigger manually, or on a tag like `pack-v*`. The runtime daemon downloads these via
+# STROBES_PACK_URL (see strobes_shell_agent/pack.py).
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "pack-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm   # native arm64 runner; falls back via qemu if unavailable
+            image: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pack in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD/sandbox_pack":/src:ro -v "$PWD/sandbox_pack/out":/out \
+            ${{ matrix.image }} bash -lc '
+              set -e
+              export HOME=/root PATH=/root/.local/bin:$PATH
+              curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+              uv run --python 3.12 python /src/build_pack.py --out /out \
+                --requirements /src/sandbox-requirements.in \
+                --manifest /src/tools.manifest.json \
+                --python-version 3.12 --tar
+            '
+      - name: Validate pack (offline) on Rocky 8
+        run: |
+          PY=out/linux-${{ matrix.arch }}/python/*/bin/python3
+          docker run --rm --network none \
+            -v "$PWD/sandbox_pack":/w:ro rockylinux:8 bash -lc "
+              \$(ls /w/$PY) /w/test_pack.py --pack /w/out/linux-${{ matrix.arch }} --skip-relocate
+            "
+      - name: Smoke-test bundled nmap on Alpine (musl, no glibc)
+        run: |
+          PACK=out/linux-${{ matrix.arch }}
+          docker run --rm --network none -v "$PWD/sandbox_pack/$PACK":/p:ro alpine:3.19 sh -lc '
+            NMAPDIR=/p/share/nmap/data /p/bin/nmap -sT -Pn -p 80 127.0.0.1 | grep -q "Nmap done"
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-pack-linux-${{ matrix.arch }}
+          path: sandbox_pack/out/strobes-sandbox-pack-linux-${{ matrix.arch }}.tar.gz
+
+  native:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: macos-aarch64
+            runner: macos-14      # Apple silicon
+          - triple: macos-x86_64
+            runner: macos-13      # Intel
+          - triple: windows-x86_64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build pack
+        shell: bash
+        run: |
+          uv run --python 3.12 python sandbox_pack/build_pack.py \
+            --out sandbox_pack/out --python-version 3.12 --tar
+      - name: Validate pack
+        shell: bash
+        run: |
+          PACK=$(ls -d sandbox_pack/out/${{ matrix.triple }})
+          PY=$(ls "$PACK"/python/*/bin/python3* 2>/dev/null | head -1 || ls "$PACK"/python/*/python.exe | head -1)
+          "$PY" sandbox_pack/test_pack.py --pack "$PACK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-pack-${{ matrix.triple }}
+          path: sandbox_pack/out/strobes-sandbox-pack-${{ matrix.triple }}.tar.gz
+
+  publish:
+    needs: [linux, native]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/pack-v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

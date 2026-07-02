@@ -12,6 +12,7 @@ from typing import Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from strobes_shell_agent import pack
 from strobes_shell_agent.executor import (
     execute_shell_command,
     execute_code,
@@ -84,6 +85,18 @@ class ShellBridgeClient:
         """Connect with automatic reconnection on disconnect."""
         self._running = True
         backoff = INITIAL_BACKOFF
+
+        # Provision the sandbox pack once at startup (no-op unless STROBES_PACK_URL is
+        # set or a pack is already installed). Runs in a thread so a large download
+        # never blocks the event loop. Never raises.
+        try:
+            p = await asyncio.to_thread(pack.ensure_pack)
+            if p:
+                logger.info("Sandbox pack ready: %s", pack.status())
+            else:
+                logger.info("No sandbox pack; using host tools.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Sandbox pack provisioning skipped: {e}")
 
         while self._running:
             try:
@@ -165,6 +178,7 @@ class ShellBridgeClient:
                 "cwd": self.cwd,
                 "python": platform.python_version(),
                 "agent_version": "0.1.0",
+                "pack": pack.status(),
             },
         }))
 

@@ -1,0 +1,83 @@
+{
+  "//": "Static CLI security tools shipped in the pack's bin/ dir. build_pack.py resolves each",
+  "//2": "entry for the target (os,arch), downloads it, extracts the named binary, and records",
+  "//3": "the observed sha256 into tools.lock.json for reproducible offline verification.",
+  "//4": "URL templates use {version} {os} {arch} {arch2}; per-tool os/arch maps normalise naming.",
+  "//5": "A tool with no build for a given (os,arch) is skipped (logged), never fatal.",
+  "os_map_default": { "linux": "linux", "macos": "macos", "windows": "windows" },
+  "arch_map_default": { "x86_64": "amd64", "aarch64": "arm64" },
+  "tools": [
+    {
+      "name": "nuclei",
+      "version": "3.6.2",
+      "archive": "zip",
+      "binary": "nuclei",
+      "url": "https://github.com/projectdiscovery/nuclei/releases/download/v{version}/nuclei_{version}_{os}_{arch}.zip",
+      "os_map": { "linux": "linux", "macos": "macOS", "windows": "windows" },
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
+    },
+    {
+      "name": "httpx",
+      "version": "1.6.9",
+      "archive": "zip",
+      "binary": "httpx",
+      "url": "https://github.com/projectdiscovery/httpx/releases/download/v{version}/httpx_{version}_{os}_{arch}.zip",
+      "os_map": { "linux": "linux", "macos": "macOS", "windows": "windows" },
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
+    },
+    {
+      "name": "subfinder",
+      "version": "2.6.8",
+      "archive": "zip",
+      "binary": "subfinder",
+      "url": "https://github.com/projectdiscovery/subfinder/releases/download/v{version}/subfinder_{version}_{os}_{arch}.zip",
+      "os_map": { "linux": "linux", "macos": "macOS", "windows": "windows" },
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
+    },
+    {
+      "name": "dnsx",
+      "version": "1.2.2",
+      "archive": "zip",
+      "binary": "dnsx",
+      "url": "https://github.com/projectdiscovery/dnsx/releases/download/v{version}/dnsx_{version}_{os}_{arch}.zip",
+      "os_map": { "linux": "linux", "macos": "macOS", "windows": "windows" },
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
+    },
+    {
+      "name": "ffuf",
+      "version": "2.1.0",
+      "archive": "tar.gz",
+      "binary": "ffuf",
+      "url": "https://github.com/ffuf/ffuf/releases/download/v{version}/ffuf_{version}_{os}_{arch}.tar.gz",
+      "os_map": { "linux": "linux", "macos": "macos", "windows": "windows" },
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64", "windows/x86_64"]
+    },
+    {
+      "name": "gobuster",
+      "version": "3.6.0",
+      "archive": "tar.gz",
+      "binary": "gobuster",
+      "url": "https://github.com/OJ/gobuster/releases/download/v{version}/gobuster_Linux_{arch2}.tar.gz",
+      "arch_map": { "x86_64": "x86_64", "aarch64": "arm64" },
+      "//": "gobuster publishes capitalised-OS archives; template kept Linux-only, tune per release.",
+      "platforms": ["linux/x86_64", "linux/aarch64"]
+    },
+    {
+      "name": "nmap",
+      "version": "7.94SVN",
+      "archive": "tar.gz",
+      "kind": "bundle",
+      "//": "ernw portable nmap is musl-static (runs on ANY Linux incl. Alpine/old-glibc, no",
+      "//2": "glibc floor). Flat archive: nmap/ncat/nping + data/. Needs NMAPDIR at runtime.",
+      "//3": "Connect scan (-sT) works unprivileged; SYN (-sS) needs root/cap_net_raw.",
+      "//4": "Linux-only upstream. macOS/Windows use host nmap (Windows needs Npcap driver).",
+      "url": "https://github.com/ernw/static-toolbox/releases/download/nmap-v{version}/nmap-{version}-{arch3}-portable.tar.gz",
+      "arch3": { "x86_64": "x86_64", "aarch64": "aarch64" },
+      "bundle_dir": "nmap",
+      "binaries": ["nmap", "ncat", "nping"],
+      "primary": "nmap",
+      "env": { "NMAPDIR": "share/nmap/data" },
+      "platforms": ["linux/x86_64", "linux/aarch64"]
+    }
+  ]
+}

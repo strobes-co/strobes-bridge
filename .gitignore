@@ -27,3 +27,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Sandbox pack build outputs (large binaries; built in CI / released as artifacts)
+sandbox_pack/out/
