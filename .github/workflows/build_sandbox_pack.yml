@@ -10,6 +10,11 @@ name: Build Sandbox Packs
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "sandbox_pack/**"
+      - "strobes_shell_agent/pack.py"
+      - ".github/workflows/build_sandbox_pack.yml"
   push:
     tags:
       - "pack-v*"
