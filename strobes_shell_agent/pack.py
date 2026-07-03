@@ -64,26 +64,32 @@ def _is_pack(path: Path) -> bool:
     return (path / "pack.manifest.json").is_file()
 
 
+def _packs_in(root: Path, t: str):
+    """Yield pack dirs under ``root`` for triple ``t``: the dir itself, the exact triple,
+    and any profiled variant (e.g. ``internal-ad-linux-x86_64``)."""
+    yield root                 # root itself is a pack (manifest directly inside)
+    yield root / t             # base pack, e.g. linux-x86_64
+    try:
+        for d in sorted(root.glob(f"*-{t}")):   # profiled, e.g. internal-ad-linux-x86_64
+            yield d
+    except OSError:
+        pass
+
+
 def _candidate_dirs():
-    """Yield candidate pack dirs in priority order."""
+    """Yield candidate pack dirs in priority order (base or profiled)."""
     t = triple()
-    # 1. explicit path
     explicit = os.environ.get(PACK_PATH_ENV)
     if explicit:
         yield Path(explicit).expanduser()
-    # 2. PyInstaller-embedded pack (single-file binary ships the pack inside it)
+    roots = []
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base = Path(sys._MEIPASS)
-        yield base / "pack" / t
-        yield base / "pack"
-    # 3. pack co-located next to the executable (archive/self-extracting layouts)
+        roots.append(Path(sys._MEIPASS) / "pack")          # PyInstaller-embedded
     if getattr(sys, "frozen", False):
-        exe_dir = Path(sys.executable).resolve().parent
-        yield exe_dir / "pack" / t
-        yield exe_dir / "pack"
-    # 4. default install / download-cache dir
-    root = Path(os.environ.get(PACK_DIR_ENV, DEFAULT_ROOT)).expanduser()
-    yield root / t
+        roots.append(Path(sys.executable).resolve().parent / "pack")  # next-to-exe
+    roots.append(Path(os.environ.get(PACK_DIR_ENV, DEFAULT_ROOT)).expanduser())  # cache
+    for root in roots:
+        yield from _packs_in(root, t)
 
 
 @lru_cache(maxsize=1)
@@ -226,6 +232,7 @@ def status() -> dict:
         "present": True,
         "path": str(pack),
         "triple": m.get("triple", triple()),
+        "profile": m.get("profile", "base"),
         "python_version": m.get("python_version"),
         "packages": len(m.get("packages", [])),
         "tools": sorted((m.get("tools") or {}).keys()),
@@ -252,18 +259,21 @@ def _reset_caches() -> None:
 
 def _bundled_tarball() -> Optional[Path]:
     """Path to a pack tarball shipped INSIDE the artifact (embedded in the PyInstaller
-    binary, or sitting next to the executable), for the current triple. None if absent."""
+    binary, or next to the executable) for the current triple — base or profiled (e.g.
+    strobes-sandbox-pack-internal-ad-<triple>.tar.gz). None if absent."""
     t = triple()
-    fname = f"strobes-sandbox-pack-{t}.tar.gz"
     roots = []
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         roots.append(Path(sys._MEIPASS))
     if getattr(sys, "frozen", False):
         roots.append(Path(sys.executable).resolve().parent)
     for r in roots:
-        cand = r / fname
-        if cand.is_file():
-            return cand
+        try:
+            hits = sorted(r.glob(f"strobes-sandbox-pack-*{t}.tar.gz"))
+        except OSError:
+            hits = []
+        if hits:
+            return hits[0]
     return None
 
 

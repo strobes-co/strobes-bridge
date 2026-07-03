@@ -1,0 +1,25 @@
+# Strobes Sandbox Pack — Internal-network + Active Directory pentest tools (Python).
+#
+# Installed into the pack's interpreter alongside sandbox-requirements.in, so an
+# internal/AD engagement has the toolkit offline with no host install. Console scripts
+# (impacket-secretsdump, nxc, certipy, bloodhound-python, mitm6, coercer, …) land on the
+# pack's PATH. Git-only tools (Responder, enum4linux-ng, windapsearch) are handled
+# separately as bundles — see the pack README, not here.
+#
+# Pins are loose; build_pack.py compiles a fully-pinned, hashed lock per platform.
+
+# --- Tier 1: core AD/internal ---
+impacket>=0.11            # secretsdump, GetUserSPNs, GetNPUsers, *exec, ntlmrelayx, mssqlclient…
+netexec @ git+https://github.com/Pennyw0rth/NetExec.git   # nxc — SMB/LDAP/WinRM/… (ex-CME; git-only)
+certipy-ad>=4.8           # AD CS enumeration + abuse (ESC1–ESC8)
+bloodhound>=1.7           # bloodhound-python: remote AD attack-path collector
+
+# --- Tier 2: strongly recommended ---
+mitm6>=0.3                # IPv6 DNS takeover → feeds ntlmrelayx (needs raw sockets/root)
+coercer>=2.4              # authentication coercion (PetitPotam/PrinterBug/…)
+smbmap>=1.10              # SMB share enumeration/exploitation
+ldapdomaindump>=0.9       # LDAP dump of the domain
+adidnsdump>=1.4           # AD-integrated DNS records
+bloodyAD>=2.0             # live LDAP recon + object edits (add-computer, shadow creds)
+pywerview>=0.6            # PowerView-style LDAP recon from *nix
+lsassy>=3.1               # remote lsass secret extraction (pairs with nxc)

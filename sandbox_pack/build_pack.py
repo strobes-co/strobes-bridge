@@ -48,6 +48,14 @@ for _s in (sys.stdout, sys.stderr):
 
 HERE = Path(__file__).resolve().parent
 
+# Pack profiles → requirements files (relative to HERE). "base" is the lean web/CLI pack
+# (all wheels, no compiler). "internal-ad" adds impacket/nxc/certipy/... and needs a C +
+# Rust toolchain at build time (netifaces, aardwolf) — build it on manylinux/CI runners.
+PROFILE_REQS = {
+    "base": ["sandbox-requirements.in"],
+    "internal-ad": ["sandbox-requirements.in", "internal-ad-requirements.in"],
+}
+
 
 # --------------------------------------------------------------------------- #
 # platform helpers
@@ -142,11 +150,12 @@ def _under_reparse(path: Path, root: Path) -> bool:
     return False
 
 
-def install_packages(uv: str, pybin: Path, req_in: Path, pack: Path, triple: str) -> Path:
-    """Compile a pinned+hashed lock, then install into the standalone interpreter."""
-    lock = pack / f"sandbox-requirements.{triple}.lock"
+def install_packages(uv: str, pybin: Path, req_ins: list, pack: Path, lock_key: str) -> Path:
+    """Compile a pinned+hashed lock from one or more requirements files, then install
+    into the standalone interpreter."""
+    lock = pack / f"sandbox-requirements.{lock_key}.lock"
     run([uv, "pip", "compile", "--python", str(pybin), "--generate-hashes",
-         "-o", str(lock), str(req_in)])
+         "-o", str(lock), *[str(r) for r in req_ins]])
     # Install straight into the standalone interpreter's own site-packages (the
     # py-app-standalone approach) so the tree stays relocatable — no venv indirection
     # whose pyvenv.cfg would hard-code an absolute base path. uv marks the managed
@@ -416,7 +425,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=str(HERE / "out"), help="output root dir")
     ap.add_argument("--python-version", default="3.12")
-    ap.add_argument("--requirements", default=str(HERE / "sandbox-requirements.in"))
+    ap.add_argument("--profile", default="base", choices=list(PROFILE_REQS),
+                    help="which toolset to bundle (base = web/CLI; internal-ad adds AD tools)")
+    ap.add_argument("--requirements", default=None,
+                    help="override the requirements file(s) for the profile")
     ap.add_argument("--manifest", default=str(HERE / "tools.manifest.json"))
     ap.add_argument("--uv", default=None, help="path to uv binary")
     ap.add_argument("--no-tools", action="store_true", help="skip CLI tool download")
@@ -428,19 +440,24 @@ def main() -> int:
     uv = find_uv(args.uv)
     os_name, arch = detect_os(), detect_arch()
     triple = f"{os_name}-{arch}"
+    # profiled packs get a distinct name/dir so base + internal-ad can coexist
+    pack_name = triple if args.profile == "base" else f"{args.profile}-{triple}"
+    req_ins = ([Path(args.requirements)] if args.requirements
+               else [HERE / r for r in PROFILE_REQS[args.profile]])
     out = Path(args.out).resolve()
-    pack = out / triple
+    pack = out / pack_name
     if pack.exists():
         shutil.rmtree(pack)
     pack.mkdir(parents=True)
 
-    print(f"[1/5] uv={uv}  target={triple}  python={args.python_version}")
+    print(f"[1/5] uv={uv}  target={pack_name}  python={args.python_version}")
+    print(f"      profile={args.profile}  requirements={[r.name for r in req_ins]}")
     print("[2/5] installing standalone python …")
     pybin = install_python(uv, pack, args.python_version)
     print(f"      interpreter: {pybin}")
 
     print("[3/5] installing packages into interpreter …")
-    lockfile = install_packages(uv, pybin, Path(args.requirements), pack, triple)
+    lockfile = install_packages(uv, pybin, req_ins, pack, pack_name)
     relocate_fixup(pack, pybin)
 
     tools_lock, tools_env, tools_bin_dirs = {}, {}, []
@@ -461,6 +478,7 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "triple": triple,
+        "profile": args.profile,
         "os": os_name,
         "arch": arch,
         "python_version": args.python_version,
@@ -477,10 +495,10 @@ def main() -> int:
     print(f"      packages: {len(manifest['packages'])}  tools: {len(tools_lock)}")
 
     if args.tar:
-        tarpath = out / f"strobes-sandbox-pack-{triple}.tar.gz"
+        tarpath = out / f"strobes-sandbox-pack-{pack_name}.tar.gz"
         print(f"[+] taring -> {tarpath}")
         with tarfile.open(tarpath, "w:gz") as t:
-            t.add(pack, arcname=triple)
+            t.add(pack, arcname=pack_name)
         print(f"    size: {tarpath.stat().st_size / 1e6:.1f} MB")
 
     print(f"\n✅ pack built: {pack}")
