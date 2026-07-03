@@ -272,7 +272,8 @@ class ShellBridgeClient:
         command = msg.get("command")
         params = msg.get("params", {})
 
-        logger.info(f"Executing command: {command} (request_id={request_id})")
+        logger.info(f"Executing command: {command} (request_id={request_id}) params={params}")
+        t0 = time.monotonic()
 
         try:
             result = await self._dispatch_command(command, params)
@@ -280,15 +281,26 @@ class ShellBridgeClient:
             logger.error(f"Command {command} failed: {e}", exc_info=True)
             result = {"success": False, "error": str(e)}
 
+        dt = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            f"Completed {command} (request_id={request_id}) success={result.get('success')} "
+            f"exit={result.get('exit_code')} in {dt}ms "
+            f"stdout={len(result.get('stdout','') or '')}b stderr={len(result.get('stderr','') or '')}b"
+        )
+
         # Send response
         try:
-            await self._ws.send(json.dumps({
+            payload = json.dumps({
                 "type": "response",
                 "request_id": request_id,
                 "data": result,
-            }))
+            })
+            await self._ws.send(payload)
+            logger.info(f"Response sent for {request_id} ({len(payload)}b)")
         except ConnectionClosed:
             logger.warning(f"Cannot send response for {request_id}: connection closed")
+        except Exception as e:
+            logger.error(f"Failed to send response for {request_id}: {e}", exc_info=True)
 
     async def _dispatch_command(self, command: str, params: dict) -> dict:
         """Dispatch a command to the appropriate executor."""
