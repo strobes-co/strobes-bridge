@@ -12,17 +12,21 @@ from strobes_shell_agent import pack
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Isolate every test from ambient pack env + the lru_cache."""
-    for var in (pack.PACK_PATH_ENV, pack.PACK_DIR_ENV, pack.PACK_URL_ENV, pack.PACK_DISABLE_ENV):
+def _clean_env(monkeypatch, tmp_path):
+    """Isolate every test from ambient pack env + the lru_cache. Point the default pack
+    dir at an empty temp dir so a real pack in ~/.strobes-shell-agent can't leak in."""
+    for var in (pack.PACK_PATH_ENV, pack.PACK_URL_ENV, pack.PACK_DISABLE_ENV):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(pack.PACK_DIR_ENV, str(tmp_path / "empty-pack-root"))
     pack.find_pack.cache_clear()
     pack._path_prefix.cache_clear()
     pack._extra_env.cache_clear()
+    pack._nuclei_config.cache_clear()
     yield
     pack.find_pack.cache_clear()
     pack._path_prefix.cache_clear()
     pack._extra_env.cache_clear()
+    pack._nuclei_config.cache_clear()
 
 
 def _make_pack(root: Path, triple: str = None) -> Path:

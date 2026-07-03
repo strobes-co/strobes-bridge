@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -63,21 +64,37 @@ def _is_pack(path: Path) -> bool:
     return (path / "pack.manifest.json").is_file()
 
 
-@lru_cache(maxsize=1)
-def find_pack() -> Optional[Path]:
-    """Return the extracted pack dir if one is present, else None. Cached."""
-    if _truthy(os.environ.get(PACK_DISABLE_ENV)):
-        return None
+def _candidate_dirs():
+    """Yield candidate pack dirs in priority order."""
+    t = triple()
+    # 1. explicit path
     explicit = os.environ.get(PACK_PATH_ENV)
     if explicit:
-        p = Path(explicit).expanduser()
-        if _is_pack(p):
-            return p.resolve()
-        log.warning("%s=%s is not a valid pack (no pack.manifest.json)", PACK_PATH_ENV, explicit)
+        yield Path(explicit).expanduser()
+    # 2. PyInstaller-embedded pack (single-file binary ships the pack inside it)
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+        yield base / "pack" / t
+        yield base / "pack"
+    # 3. pack co-located next to the executable (archive/self-extracting layouts)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        yield exe_dir / "pack" / t
+        yield exe_dir / "pack"
+    # 4. default install / download-cache dir
     root = Path(os.environ.get(PACK_DIR_ENV, DEFAULT_ROOT)).expanduser()
-    candidate = root / triple()
-    if _is_pack(candidate):
-        return candidate.resolve()
+    yield root / t
+
+
+@lru_cache(maxsize=1)
+def find_pack() -> Optional[Path]:
+    """Return the pack dir if one is present, else None. Resolution: explicit env path →
+    PyInstaller-embedded → next-to-executable → default install/cache dir. Cached."""
+    if _truthy(os.environ.get(PACK_DISABLE_ENV)):
+        return None
+    for cand in _candidate_dirs():
+        if _is_pack(cand):
+            return cand.resolve()
     return None
 
 
@@ -144,15 +161,51 @@ def _extra_env() -> dict:
     return out
 
 
+@lru_cache(maxsize=1)
+def _nuclei_config() -> Optional[str]:
+    """Materialize a writable nuclei config dir whose .templates-config.json points at
+    the pack's bundled templates, so `nuclei` finds them by default and runs offline.
+    Never writes into the (possibly read-only) pack — uses a per-user cache dir. Returns
+    the config dir path, or None if the pack ships no templates."""
+    pack = find_pack()
+    if not pack:
+        return None
+    m = _manifest(pack).get("nuclei")
+    if not m:
+        return None
+    tpl = (pack / m["templates"]).resolve()
+    if not tpl.is_dir():
+        return None
+    base = Path(os.environ.get(PACK_DIR_ENV, DEFAULT_ROOT)).expanduser()
+    cfg = base / "nuclei-config"
+    try:
+        cfg.mkdir(parents=True, exist_ok=True)
+        src = pack / m["config"]
+        if src.is_dir():
+            for f in src.iterdir():
+                dst = cfg / f.name
+                if f.is_file() and f.name != ".templates-config.json" and not dst.exists():
+                    shutil.copy2(f, dst)
+        (cfg / ".templates-config.json").write_text(
+            json.dumps({"nuclei-templates-directory": str(tpl)}))
+        return str(cfg)
+    except OSError as e:
+        log.warning("could not set up nuclei config: %s", e)
+        return None
+
+
 def build_env(base: Optional[dict] = None) -> dict:
     """Return an environment dict with the pack prepended to PATH and any bundle-tool
-    env vars (e.g. NMAPDIR) applied. If no pack is present, returns a copy of ``base``
-    unchanged. Safe to call on every command."""
+    env vars (e.g. NMAPDIR, NUCLEI_CONFIG_DIR) applied. If no pack is present, returns a
+    copy of ``base`` unchanged. Safe to call on every command."""
     env = dict(os.environ if base is None else base)
     prefix = _path_prefix()
     if prefix:
         env["PATH"] = prefix + os.pathsep + env.get("PATH", "")
     env.update(_extra_env())   # pack-shipped tools' data dirs win (agent expects them)
+    nc = _nuclei_config()
+    if nc:
+        env["NUCLEI_CONFIG_DIR"] = nc   # bundled nuclei-templates, offline by default
     return env
 
 
@@ -194,19 +247,56 @@ def _reset_caches() -> None:
     find_pack.cache_clear()
     _path_prefix.cache_clear()
     _extra_env.cache_clear()
+    _nuclei_config.cache_clear()
+
+
+def _bundled_tarball() -> Optional[Path]:
+    """Path to a pack tarball shipped INSIDE the artifact (embedded in the PyInstaller
+    binary, or sitting next to the executable), for the current triple. None if absent."""
+    t = triple()
+    fname = f"strobes-sandbox-pack-{t}.tar.gz"
+    roots = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        roots.append(Path(sys._MEIPASS))
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+    for r in roots:
+        cand = r / fname
+        if cand.is_file():
+            return cand
+    return None
 
 
 def ensure_pack(download: bool = True, timeout: int = 300) -> Optional[Path]:
-    """Locate a pack; if absent and ``STROBES_PACK_URL`` is set, download + verify +
-    extract it into the default dir. Returns the pack path or None. Never raises — a
-    failed download just leaves the daemon on host tools.
-
-    Expects ``<STROBES_PACK_URL>/strobes-sandbox-pack-<triple>.tar.gz`` and, if present,
-    a sibling ``.sha256`` file whose first token is the expected digest.
+    """Make a pack available and return its path (or None). Order, DEFAULT IS OFFLINE:
+      1. already present (baked/co-located/cached) → use it, no network;
+      2. a pack tarball bundled inside the artifact → self-extract locally, no network;
+      3. ONLY if ``STROBES_PACK_URL`` is explicitly set → download + verify + extract.
+    Never raises — any failure just leaves the daemon on host tools.
     """
     existing = find_pack()
-    if existing or not download:
+    if existing:
         return existing
+
+    # 2. offline self-extract from a pack tarball embedded in the binary
+    bundled = _bundled_tarball()
+    if bundled:
+        root = Path(os.environ.get(PACK_DIR_ENV, DEFAULT_ROOT)).expanduser()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            log.info("extracting bundled sandbox pack (offline): %s", bundled.name)
+            with tarfile.open(bundled) as tar:
+                _safe_extract(tar, root)
+            _reset_caches()
+            found = find_pack()
+            if found:
+                return found
+        except Exception as e:  # noqa: BLE001
+            log.error("bundled pack extraction failed: %s", e)
+
+    # 3. explicit opt-in network download (never the default — requires STROBES_PACK_URL)
+    if not download:
+        return None
     base_url = os.environ.get(PACK_URL_ENV)
     if not base_url:
         return None

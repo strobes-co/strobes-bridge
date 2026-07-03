@@ -140,6 +140,14 @@ def check_tools(pack: Path) -> bool:
     tool_env["PATH"] = os.pathsep.join(path_dirs) + os.pathsep + tool_env.get("PATH", "")
     for var, rel in (manifest.get("env") or {}).items():
         tool_env[var] = str((pack / rel).resolve())
+    # nuclei bundled templates: point NUCLEI_CONFIG_DIR at a config naming the templates
+    nuclei_meta = manifest.get("nuclei")
+    if nuclei_meta:
+        tpl = (pack / nuclei_meta["templates"]).resolve()
+        cfg = Path(tempfile.mkdtemp(prefix="nuclei-cfg-"))
+        (cfg / ".templates-config.json").write_text(
+            json.dumps({"nuclei-templates-directory": str(tpl)}))
+        tool_env["NUCLEI_CONFIG_DIR"] = str(cfg)
     is_windows = manifest.get("os") == "windows"
     is_mac_arm = manifest.get("os") == "macos" and manifest.get("arch") == "aarch64"
     passed = True
@@ -182,6 +190,13 @@ def check_tools(pack: Path) -> bool:
                       f"(binary present + NMAPDIR set){RST}")
             else:
                 bad(f"nmap connect-scan + NMAPDIR ({out[-160:]})"); passed = False
+        # nuclei: prove bundled templates load offline (no -t, no network fetch)
+        if name == "nuclei" and runnable and nuclei_meta:
+            s = subprocess.run([str(binp), "-tl", "-duc"],
+                               capture_output=True, text=True, env=tool_env)
+            n = len([l for l in s.stdout.splitlines() if l.strip().endswith(".yaml")])
+            (ok if n > 0 else bad)(f"nuclei templates load offline ({n} templates)")
+            passed &= n > 0
     return passed
 
 
