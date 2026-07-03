@@ -166,6 +166,48 @@ def show_id():
     click.echo(bridge_id)
 
 
+@main.command()
+def selftest():
+    """Verify the bundled sandbox pack works offline (nmap, nuclei+templates, python).
+
+    Provisions the pack (from the embedded/baked bundle — no network) and runs a few
+    real commands through the same executor the agent uses. Exit 0 if all pass.
+    """
+    from strobes_shell_agent import pack, executor
+
+    pack.ensure_pack()
+    st = pack.status()
+    click.echo(f"pack: {st}")
+    if not st.get("present"):
+        click.echo("FAIL: no sandbox pack found", err=True)
+        sys.exit(1)
+
+    async def _run():
+        ok = True
+        # nmap connect scan
+        r = await executor.execute_shell_command("nmap -sT -Pn -p 80 127.0.0.1")
+        good = "Nmap done" in (r["stdout"] + r["stderr"])
+        click.echo(f"  [{'ok' if good else 'FAIL'}] nmap connect scan")
+        ok &= good
+        # nuclei templates load offline
+        r = await executor.execute_shell_command("nuclei -tl -duc")
+        n = len([l for l in r["stdout"].splitlines() if l.strip().endswith(".yaml")])
+        click.echo(f"  [{'ok' if n else 'FAIL'}] nuclei templates: {n}")
+        ok &= n > 0
+        # python with agent packages
+        r = await executor.execute_code(
+            "python", "import boto3, reportlab; print(boto3.__version__)")
+        click.echo(f"  [{'ok' if r['success'] else 'FAIL'}] python/boto3: {r['stdout'].strip()}")
+        ok &= r["success"]
+        return ok
+
+    if asyncio.run(_run()):
+        click.echo("selftest: ALL OK")
+    else:
+        click.echo("selftest: FAILURES", err=True)
+        sys.exit(1)
+
+
 def _detect_default_scope() -> str:
     """systemd: user scope unless we're running as root."""
     return "system" if os.geteuid() == 0 else "user"

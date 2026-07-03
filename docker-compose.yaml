@@ -5,19 +5,17 @@ services:
     container_name: strobes-shell-agent
     env_file:
       - .env
-    environment:
-      # Auto-provision the sandbox pack (nmap/nuclei/boto3/… ) on startup. Uses the
-      # value from .env if set, otherwise the published pack release. Set
-      # STROBES_PACK_DISABLE=1 in .env to use only host-installed tools.
-      - STROBES_PACK_URL=${STROBES_PACK_URL:-https://github.com/strobes-co/strobes-bridge/releases/download/pack-v0.1.0}
+    # The sandbox pack (nmap/nuclei/nuclei-templates/boto3/… ) is BAKED into the image
+    # at build time (see Dockerfile) — no runtime download, works fully offline. Set
+    # STROBES_PACK_DISABLE=1 in .env to ignore it and use only host-installed tools.
     volumes:
       # Mount host workspace into container
       - ./workspace:/workspace
-      # Persist the downloaded pack + bridge_id across restarts (avoids re-download)
-      - pack-cache:/root/.strobes-shell-agent
+      # Persist bridge_id (and any runtime state) across restarts
+      - state:/root/.strobes-shell-agent
     restart: unless-stopped
     # Override CMD if you need extra flags
     # command: ["connect", "--verbose"]
 
 volumes:
-  pack-cache:
+  state:

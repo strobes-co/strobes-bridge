@@ -373,6 +373,37 @@ def _finalize_bundle(tool: dict, share: Path, pack: Path, bindir: Path, exe: str
             "expose": expose, "binaries": exposed, "env": tool.get("env") or {}}
 
 
+def install_nuclei_templates(pack: Path, tools_lock: dict) -> Optional[dict]:
+    """Fetch the nuclei-templates into the pack so nuclei runs fully offline. Uses the
+    pack's own nuclei binary (native to the build host) to install templates, and stores
+    a config dir alongside. At runtime pack.py points NUCLEI_CONFIG_DIR at a writable copy
+    whose .templates-config.json names the resolved templates path."""
+    meta = tools_lock.get("nuclei")
+    if not meta:
+        print("  (nuclei not in pack; skipping templates)")
+        return None
+    nbin = pack / "bin" / meta["binary"]
+    tpl = pack / "share" / "nuclei-templates"
+    cfg = pack / "share" / "nuclei-config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        # NOTE: do NOT pass -disable-update-check here — it disables the update mechanism
+        # entirely, so -update-templates would download nothing. This step needs network.
+        env = {**os.environ, "HOME": td, "NUCLEI_CONFIG_DIR": str(cfg)}
+        try:
+            run([str(nbin), "-update-templates", "-update-template-dir", str(tpl)],
+                env=env, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  ! nuclei templates fetch failed: {e}")
+            return None
+    count = sum(1 for _ in tpl.rglob("*.yaml")) if tpl.exists() else 0
+    if not count:
+        print("  ! nuclei templates: none installed")
+        return None
+    print(f"  ok nuclei-templates: {count} templates -> share/nuclei-templates")
+    return {"templates": "share/nuclei-templates", "config": "share/nuclei-config"}
+
+
 def pip_freeze(uv: str, pybin: Path) -> list[str]:
     out = subprocess.run([uv, "pip", "freeze", "--python", str(pybin)],
                          capture_output=True, text=True, check=True)
@@ -389,6 +420,8 @@ def main() -> int:
     ap.add_argument("--manifest", default=str(HERE / "tools.manifest.json"))
     ap.add_argument("--uv", default=None, help="path to uv binary")
     ap.add_argument("--no-tools", action="store_true", help="skip CLI tool download")
+    ap.add_argument("--no-templates", action="store_true",
+                    help="skip bundling nuclei-templates (faster builds/tests)")
     ap.add_argument("--tar", action="store_true", help="also produce a .tar.gz")
     args = ap.parse_args()
 
@@ -419,6 +452,11 @@ def main() -> int:
     else:
         print("[4/5] skipping CLI tools (--no-tools)")
 
+    nuclei_cfg = None
+    if not args.no_tools and not args.no_templates:
+        print("[4b] bundling nuclei-templates …")
+        nuclei_cfg = install_nuclei_templates(pack, tools_lock)
+
     print("[5/5] writing pack manifest …")
     manifest = {
         "schema": 1,
@@ -433,6 +471,7 @@ def main() -> int:
         "tools": tools_lock,
         "env": tools_env,        # runtime env vars (pack-relative), e.g. {"NMAPDIR": "..."}
         "bin_dirs": tools_bin_dirs,  # extra PATH dirs (pack-relative), e.g. Windows nmap dir
+        "nuclei": nuclei_cfg,    # {templates, config} pack-relative, or null
     }
     (pack / "pack.manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"      packages: {len(manifest['packages'])}  tools: {len(tools_lock)}")

@@ -121,28 +121,40 @@ All options can be set via CLI flags, environment variables, or a `.env` file.
 | `--name` | `STROBES_SHELL_NAME` | No | Display name (defaults to hostname) |
 | `--cwd` | `STROBES_CWD` | No | Working directory for commands |
 | `-v` | `STROBES_VERBOSE` | No | Enable debug logging |
-| — | `STROBES_PACK_URL` | No | Base URL to auto-download the sandbox pack from (default: published release) |
-| — | `STROBES_PACK_PATH` | No | Path to a pre-extracted pack (air-gapped) |
-| — | `STROBES_PACK_DIR` | No | Where downloaded packs are cached (default `~/.strobes-shell-agent/pack`) |
-| — | `STROBES_PACK_DISABLE` | No | Set to `1` to ignore any pack and use only host tools |
+| — | `STROBES_PACK_PATH` | No | Point at a specific pre-extracted pack |
+| — | `STROBES_PACK_DIR` | No | Pack lookup/extract dir (default `~/.strobes-shell-agent/pack`) |
+| — | `STROBES_PACK_DISABLE` | No | Set to `1` to ignore the pack and use only host tools |
+| — | `STROBES_PACK_URL` | No | Optional: fetch a pack if none is bundled (not used by default) |
 
 The `.env` file is loaded from the current directory or `~/.strobes-shell-agent/.env`.
 
 ### Pre-installed security tools (sandbox pack)
 
-So the agent can run `nmap`, `nuclei`, `httpx`, `ffuf`, `gobuster`, `subfinder`, `dnsx` and
-Python code (`boto3`, `reportlab`, `curl_cffi`, `cryptography`, …) **without you installing
-anything**, the bridge ships a self-contained **sandbox pack**: a relocatable Python runtime +
-CLI tools, with **no Docker, root, system Python, or internet required at runtime**.
+So the agent can run `nmap`, `nuclei` (with the full **nuclei-templates**), `httpx`, `ffuf`,
+`gobuster`, `subfinder`, `dnsx` and Python code (`boto3`, `reportlab`, `curl_cffi`,
+`cryptography`, …) **without you installing anything**, a self-contained **sandbox pack** — a
+relocatable Python runtime + CLI tools + templates — ships **inside the artifact**:
 
-On startup the bridge downloads the pack matching this host's OS/arch (from `STROBES_PACK_URL`),
-verifies its checksum, and caches it under `~/.strobes-shell-agent/pack`. Commands the agent
-sends then transparently resolve to the pack's tools and interpreter; if no pack is available it
-falls back to host-installed tools. Coverage: Linux x86_64/aarch64 (glibc ≥ 2.28; nmap runs on
-any Linux incl. Alpine), macOS, and Windows. See [`sandbox_pack/README.md`](sandbox_pack/README.md).
+- **Standalone binary:** the pack is **embedded in the executable**. On first run it self-extracts
+  once to `~/.strobes-shell-agent/pack` and is reused after. One file, nothing else to download.
+- **Docker image:** the pack is **baked into the image** at build time (`STROBES_PACK_DIR=/opt/strobes-pack`).
 
-- **Air-gapped:** pre-extract a pack tarball on the host and set `STROBES_PACK_PATH=/path/<triple>`.
+**Default is fully offline — no runtime download, no external URL.** Commands the agent sends
+resolve transparently to the pack's tools and interpreter (`NMAPDIR` and nuclei templates wired
+automatically); if no pack is present it falls back to host-installed tools. Verify anytime with:
+
+```bash
+strobes-shell-agent selftest      # runs nmap + nuclei(+templates) + python offline
+```
+
+Coverage: Linux x86_64/aarch64 (nmap runs on any Linux incl. Alpine), macOS, Windows.
+See [`sandbox_pack/README.md`](sandbox_pack/README.md).
+
+- **Air-gapped:** already covered — the pack travels inside the binary/image. (Or point
+  `STROBES_PACK_PATH` at a pre-extracted pack.)
 - **Opt out:** set `STROBES_PACK_DISABLE=1` to use only host-installed tools.
+- **Optional download:** setting `STROBES_PACK_URL` lets a from-source install fetch a pack; this
+  is **not** used by default and never required for the binary or Docker image.
 - **nmap note:** connect scans (`-sT`) work everywhere; SYN/OS-detection need root/`cap_net_raw`
   (and the Npcap driver on Windows).
 
