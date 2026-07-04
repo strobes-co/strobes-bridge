@@ -60,9 +60,13 @@ python3 build_pack.py --profile internal-ad --out ./out --tar   # native (needs 
 
 A profiled pack extracts to its own dir (`internal-ad-<triple>`), so a base and an AD pack
 can coexist; `pack.find_pack()` picks whichever is present for the host arch, and
-`pack.status()["profile"]` reports which. Keep the lean **base** for web engagements; embed
-**internal-ad** for internal/AD work. Git-only tools (Responder, enum4linux-ng, windapsearch)
-are not yet bundled — they need a git-checkout mechanism rather than a wheel.
+`pack.status()["profile"]` reports which.
+
+**The shipped binary and Docker image embed `internal-ad` by default** (see `release.yml`
+and the Dockerfile), so every bridge has the full toolset offline. The lean **base** pack is
+still published as a separate tarball (via `build_sandbox_pack.yml`) for web-only, download-
+based deployments. Git-bundled tools (Responder, enum4linux-ng) ship via the `git` tool kind;
+`windapsearch` is not bundled (its `python-ldap` native dep needs system libldap).
 
 ### Platform coverage
 

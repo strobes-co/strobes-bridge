@@ -152,10 +152,16 @@ The `.env` file is loaded from the current directory or `~/.strobes-shell-agent/
 
 ### Pre-installed security tools (sandbox pack)
 
-So the agent can run `nmap`, `nuclei` (with the full **nuclei-templates**), `httpx`, `ffuf`,
-`gobuster`, `subfinder`, `dnsx` and Python code (`boto3`, `reportlab`, `curl_cffi`,
-`cryptography`, …) **without you installing anything**, a self-contained **sandbox pack** — a
-relocatable Python runtime + CLI tools + templates — ships **inside the artifact**:
+So the agent can run a full pentest toolkit **without you installing anything**, a
+self-contained **sandbox pack** — a relocatable Python runtime + CLI tools + templates —
+ships **inside the artifact**. The shipped binary/image bundle the **internal-ad** toolset:
+
+- **Web/CLI:** `nmap` (+`ncat`/`nping`), `nuclei` (with the full **nuclei-templates**),
+  `httpx`, `ffuf`, `gobuster`, `subfinder`, `dnsx`.
+- **Internal / Active Directory:** `nxc` (NetExec), impacket (`secretsdump.py`,
+  `GetUserSPNs.py`, `ntlmrelayx.py`, …), `certipy`, `bloodhound-python`, `mitm6`, `Coercer`,
+  `smbmap`, `bloodyAD`, `ldapdomaindump`, `lsassy`, **Responder**, **enum4linux-ng**.
+- **Python:** `boto3`, `reportlab`, `curl_cffi`, `cryptography`, … (the pack's own interpreter).
 
 - **Standalone binary:** the pack is **embedded in the executable**. On first run it self-extracts
   once to `~/.strobes-shell-agent/pack` and is reused after. One file, nothing else to download.
