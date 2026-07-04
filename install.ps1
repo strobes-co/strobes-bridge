@@ -15,6 +15,14 @@ param([switch]$Uninstall, [switch]$NoService)
 $ErrorActionPreference = "Stop"
 $Repo      = "strobes-co/strobes-bridge"
 $Asset     = "strobes-shell-agent-windows-amd64.exe"
+
+# Where to fetch the .exe from. When this installer is served by a Strobes tenant
+# (AI -> Shells -> one-line install), the tenant's install-script proxy rewrites
+# the token below to its own same-origin download endpoint, so the executable is
+# pulled from the tenant too (no GitHub dependency; works behind proxies that
+# block GitHub). Left as the token when fetched from GitHub raw -> use Releases.
+$DownloadBase = "__STROBES_DOWNLOAD_BASE__"
+if ($DownloadBase -like "*__STROBES_DOWNLOAD_BASE__*") { $DownloadBase = "" }
 $TaskName  = "StrobesShellAgent"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\StrobesShellAgent"
 $Target     = Join-Path $InstallDir "strobes-shell-agent.exe"
@@ -36,7 +44,13 @@ if ($Uninstall) {
 
 # --- download --------------------------------------------------------------
 if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
-$Url = "https://github.com/$Repo/releases/latest/download/$Asset"
+if ($DownloadBase) {
+  # Tenant proxy: {tenant}/api/v1/organizations/{org}/ai/bridge/download/?asset=...
+  $sep = if ($DownloadBase.Contains("?")) { "&" } else { "?" }
+  $Url = "${DownloadBase}${sep}asset=$Asset"
+} else {
+  $Url = "https://github.com/$Repo/releases/latest/download/$Asset"
+}
 Info "Downloading $Asset..."
 try { Invoke-WebRequest -Uri $Url -OutFile $Target -UseBasicParsing } catch { Fail "download failed: $Url" }
 Ok "Installed: $Target"
