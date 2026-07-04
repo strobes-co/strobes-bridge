@@ -27,14 +27,20 @@ cryptography>=42.0     # Fernet cred decrypt + jwt tooling (Rust/OpenSSL)
 lxml>=5.1              # skill scripts + python-docx/pptx dep (libxml2/libxslt)
 zstandard>=0.22        # artifact/tarball handling (C)
 
-# --- report / document generation (pdf/docx/pptx creator skills) ---
-reportlab>=4.1
-pypdf>=4.0
-pdfplumber>=0.11       # pulls pdfminer.six
+# --- report / document generation (pdf/docx/pptx/xlsx creator + report skills) ---
+reportlab>=4.1         # PDF generation
+pypdf>=4.0             # PDF read/merge
+pdfplumber>=0.11       # PDF text extraction (pulls pdfminer.six)
 pillow>=10.2           # imaging (native)
-python-docx>=1.1
-python-pptx>=0.6.23
+python-docx>=1.1       # DOCX
+python-pptx>=0.6.23    # PPTX
+markitdown[pptx]>=0.0.1a # PPTX ingest (pptx-creator skill)
 defusedxml>=0.7
+openpyxl>=3.1          # Excel .xlsx read + write (canonical; data_import_agent)
+XlsxWriter>=3.1        # Excel .xlsx write with charts/formatting
+jinja2>=3.1            # HTML / report templating (report-generation + agent tools)
+tabulate>=0.9          # text tables in reports
+pandas>=2.2            # dataframes -> excel/csv/tables (heavy: pulls numpy)
 
 # --- common skill-script helpers (pure-python, cheap to include in Tier 1) ---
 PyYAML>=6.0
