@@ -14,17 +14,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Build standalone executables for each platform
+  # macOS + Windows executables (no glibc floor). Linux is built separately in
+  # manylinux_2_28 (see build-linux) so the binary runs on glibc >= 2.28.
   build-executables:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            asset_name: strobes-shell-agent-linux-amd64
-            triple: linux-x86_64
-            sep: ":"
-            extra_args: ""
           - os: macos-latest
             asset_name: strobes-shell-agent-macos-arm64
             triple: macos-aarch64
@@ -83,46 +79,55 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}*
 
-  # Build Linux ARM64 binary inside a native ARM64 Docker container
-  build-linux-arm64:
-    runs-on: ubuntu-latest
-
+  # Linux binaries: run PyInstaller UNDER the python-build-standalone interpreter (from uv),
+  # whose portable shared libpython links a very old glibc. So a binary built on the latest
+  # runner still runs on glibc >= ~2.26 (validated on Amazon Linux 2, Rocky 8, Debian 12).
+  # Building with the runner's own python would pin the binary to its glibc (2.39).
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            asset_name: strobes-shell-agent-linux-amd64
+            triple: linux-x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm     # native arm64 runner → no QEMU
+            asset_name: strobes-shell-agent-linux-arm64
+            triple: linux-aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Build ARM64 binary (internal-ad pack embedded)
+      - name: Install toolchain (C + Rust + binutils + git for the internal-ad pack)
         run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD:/src" -w /src \
-            python:3.12-slim bash -c '
-              set -e
-              apt-get update && apt-get install -y --no-install-recommends binutils curl ca-certificates git build-essential pkg-config libffi-dev && rm -rf /var/lib/apt/lists/*
-              export UV_INSTALL_DIR=/usr/local/bin CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:/usr/local/bin:$PATH
-              curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
-              curl -LsSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path >/dev/null 2>&1
-              pip install --no-cache-dir ".[dev]"
-              uv run --python 3.12 python sandbox_pack/build_pack.py --profile internal-ad --out sandbox_pack/out --python-version 3.12 --tar
-              pyinstaller --onefile \
-                --name strobes-shell-agent-linux-arm64 \
-                --add-data "sandbox_pack/out/strobes-sandbox-pack-internal-ad-linux-aarch64.tar.gz:." \
-                --hidden-import=strobes_shell_agent \
-                --hidden-import=strobes_shell_agent.executor \
-                --hidden-import=strobes_shell_agent.client \
-                --hidden-import=strobes_shell_agent.config \
-                --hidden-import=strobes_shell_agent.pty_handler \
-                strobes_shell_agent/__main__.py
-            '
-
+          sudo apt-get update
+          sudo apt-get install -y binutils build-essential pkg-config libffi-dev git
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl -LsSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - name: Build binary (internal-ad, portable glibc)
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv python install --install-dir "$PWD/py" 3.12
+          PYBIN=$(ls "$PWD"/py/*/bin/python3 | head -1)
+          # deps so PyInstaller can freeze; installed INTO the standalone python
+          uv pip install --python "$PYBIN" --break-system-packages pyinstaller ".[dev]"
+          uv run --python 3.12 python sandbox_pack/build_pack.py --profile internal-ad \
+            --out sandbox_pack/out --python-version 3.12 --tar
+          "$PYBIN" -m PyInstaller --onefile \
+            --name "${{ matrix.asset_name }}" \
+            --add-data "sandbox_pack/out/strobes-sandbox-pack-internal-ad-${{ matrix.triple }}.tar.gz:." \
+            --hidden-import=strobes_shell_agent \
+            --hidden-import=strobes_shell_agent.executor \
+            --hidden-import=strobes_shell_agent.client \
+            --hidden-import=strobes_shell_agent.config \
+            --hidden-import=strobes_shell_agent.pty_handler \
+            strobes_shell_agent/__main__.py
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: strobes-shell-agent-linux-arm64
-          path: dist/strobes-shell-agent-linux-arm64*
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}*
 
   # Build and push multi-arch Docker image
   build-docker:
@@ -161,8 +166,8 @@ jobs:
   # Create GitHub Release with all artifacts attached
   release:
     runs-on: ubuntu-latest
-    needs: [build-executables, build-linux-arm64, build-docker]
-    if: always() && needs.build-executables.result == 'success'
+    needs: [build-executables, build-linux, build-docker]
+    if: always() && needs.build-linux.result == 'success'
 
     steps:
       - uses: actions/checkout@v4
