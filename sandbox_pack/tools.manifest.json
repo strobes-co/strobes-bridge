@@ -115,6 +115,29 @@
       "data_from": "share/nmap",
       "env": { "NMAPDIR": "share/nmap/data" },
       "platforms": ["macos/x86_64", "macos/aarch64"]
+    },
+    {
+      "name": "responder",
+      "kind": "git",
+      "//": "LLMNR/NBT-NS/mDNS poisoner. Git-only (no pip package). internal-ad profile,",
+      "//2": "*nix only (needs raw sockets). Deps (netifaces etc.) come from the AD wheels.",
+      "repo": "https://github.com/lgandx/Responder.git",
+      "ref": "master",
+      "bundle_dir": "responder",
+      "entry": { "responder": "Responder.py", "responder-dumphash": "tools/DumpHash.py" },
+      "profiles": ["internal-ad"],
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64"]
+    },
+    {
+      "name": "enum4linux-ng",
+      "kind": "git",
+      "//": "SMB/LDAP/RPC enumeration. Single script, git-only. internal-ad profile.",
+      "repo": "https://github.com/cddmp/enum4linux-ng.git",
+      "ref": "master",
+      "bundle_dir": "enum4linux-ng",
+      "entry": { "enum4linux-ng": "enum4linux-ng.py" },
+      "profiles": ["internal-ad"],
+      "platforms": ["linux/x86_64", "linux/aarch64", "macos/aarch64", "macos/x86_64"]
     }
   ]
 }

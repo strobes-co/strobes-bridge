@@ -34,11 +34,33 @@ Go to **AI > Shells > Create Shell**, select **Bridge** type, and note the `brid
 
 Go to **Settings > API Keys** and copy your key.
 
-### 3. Run the agent
+### 3. Install the agent
 
-**Option A: Pre-built binary (recommended, no Python needed)**
+**Option A: One-line install (recommended)** — downloads the binary (sandbox pack
+embedded: nmap/nuclei/… run offline), walks you through setup, and registers a service
+that starts on boot.
 
-Download from [Releases](https://github.com/strobes-co/strobes-agent-shell/releases):
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-bridge/main/install.sh | bash
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/strobes-co/strobes-bridge/main/install.ps1 | iex
+```
+
+Non-interactive (CI/automation): set `STROBES_URL`, `STROBES_API_KEY`, `STROBES_ORG_ID`
+in the environment first. Manage the service afterwards:
+
+| | Linux (systemd) | macOS (launchd) | Windows (task) |
+|---|---|---|---|
+| start/stop | `systemctl --user start\|stop co.strobes.shell-agent` | `launchctl load\|unload -w ~/Library/LaunchAgents/co.strobes.shell-agent.plist` | `Start\|Stop-ScheduledTask -TaskName StrobesShellAgent` |
+| verify tools | `strobes-shell-agent selftest` | same | same |
+| uninstall | `install.sh \| bash -s -- --uninstall` | same | `$env:STROBES_UNINSTALL='1'; irm …/install.ps1 \| iex` |
+
+**Option B: Pre-built binary (manual, no Python needed)**
+
+Download from [Releases](https://github.com/strobes-co/strobes-bridge/releases):
 
 ```bash
 # Linux
@@ -130,10 +152,16 @@ The `.env` file is loaded from the current directory or `~/.strobes-shell-agent/
 
 ### Pre-installed security tools (sandbox pack)
 
-So the agent can run `nmap`, `nuclei` (with the full **nuclei-templates**), `httpx`, `ffuf`,
-`gobuster`, `subfinder`, `dnsx` and Python code (`boto3`, `reportlab`, `curl_cffi`,
-`cryptography`, …) **without you installing anything**, a self-contained **sandbox pack** — a
-relocatable Python runtime + CLI tools + templates — ships **inside the artifact**:
+So the agent can run a full pentest toolkit **without you installing anything**, a
+self-contained **sandbox pack** — a relocatable Python runtime + CLI tools + templates —
+ships **inside the artifact**. The shipped binary/image bundle the **internal-ad** toolset:
+
+- **Web/CLI:** `nmap` (+`ncat`/`nping`), `nuclei` (with the full **nuclei-templates**),
+  `httpx`, `ffuf`, `gobuster`, `subfinder`, `dnsx`.
+- **Internal / Active Directory:** `nxc` (NetExec), impacket (`secretsdump.py`,
+  `GetUserSPNs.py`, `ntlmrelayx.py`, …), `certipy`, `bloodhound-python`, `mitm6`, `Coercer`,
+  `smbmap`, `bloodyAD`, `ldapdomaindump`, `lsassy`, **Responder**, **enum4linux-ng**.
+- **Python:** `boto3`, `reportlab`, `curl_cffi`, `cryptography`, … (the pack's own interpreter).
 
 - **Standalone binary:** the pack is **embedded in the executable**. On first run it self-extracts
   once to `~/.strobes-shell-agent/pack` and is reused after. One file, nothing else to download.

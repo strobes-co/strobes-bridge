@@ -44,6 +44,30 @@ python3 build_pack.py --out ./out --python-version 3.12 --tar
 `--tar` also emits `out/strobes-sandbox-pack-<triple>.tar.gz`. CI (`.github/workflows/build_sandbox_pack.yml`)
 builds all platforms and publishes tarballs + `.sha256` files.
 
+### Profiles
+
+`--profile` selects the toolset (see `PROFILE_REQS` in `build_pack.py`):
+
+| Profile | Adds | Build needs | Artifact name |
+|---|---|---|---|
+| `base` (default) | web/CLI: nuclei(+templates), nmap, httpx, ffuf, gobuster, subfinder, dnsx + python (boto3, reportlab, curl_cffi, …) | all wheels, **no compiler** | `strobes-sandbox-pack-<triple>` |
+| `internal-ad` | base **plus** impacket, **netexec (nxc)**, certipy, bloodhound-python, mitm6, coercer, smbmap, ldapdomaindump, adidnsdump, bloodyAD, pywerview, lsassy | **C + Rust toolchain** (netifaces=C, aardwolf=Rust via netexec) | `strobes-sandbox-pack-internal-ad-<triple>` |
+
+```bash
+python3 build_pack.py --profile internal-ad --out ./out --tar   # native (needs gcc + rust)
+./build_linux_manylinux.sh x86_64 internal-ad                   # containerised (adds rust)
+```
+
+A profiled pack extracts to its own dir (`internal-ad-<triple>`), so a base and an AD pack
+can coexist; `pack.find_pack()` picks whichever is present for the host arch, and
+`pack.status()["profile"]` reports which.
+
+**The shipped binary and Docker image embed `internal-ad` by default** (see `release.yml`
+and the Dockerfile), so every bridge has the full toolset offline. The lean **base** pack is
+still published as a separate tarball (via `build_sandbox_pack.yml`) for web-only, download-
+based deployments. Git-bundled tools (Responder, enum4linux-ng) ship via the `git` tool kind;
+`windapsearch` is not bundled (its `python-ldap` native dep needs system libldap).
+
 ### Platform coverage
 
 | Platform | Baseline | Runs on |

@@ -22,6 +22,9 @@ from strobes_shell_agent.executor import (
     upload_file,
     download_file,
     get_env_info,
+    bg_start,
+    bg_poll,
+    bg_cancel,
 )
 from strobes_shell_agent.pty_handler import (
     handle_pty_open,
@@ -179,6 +182,8 @@ class ShellBridgeClient:
                 "python": platform.python_version(),
                 "agent_version": "0.1.0",
                 "pack": pack.status(),
+                # Capabilities the platform can rely on for this daemon.
+                "features": ["bg_exec"],
             },
         }))
 
@@ -272,7 +277,8 @@ class ShellBridgeClient:
         command = msg.get("command")
         params = msg.get("params", {})
 
-        logger.info(f"Executing command: {command} (request_id={request_id})")
+        logger.info(f"Executing command: {command} (request_id={request_id}) params={params}")
+        t0 = time.monotonic()
 
         try:
             result = await self._dispatch_command(command, params)
@@ -280,15 +286,26 @@ class ShellBridgeClient:
             logger.error(f"Command {command} failed: {e}", exc_info=True)
             result = {"success": False, "error": str(e)}
 
+        dt = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            f"Completed {command} (request_id={request_id}) success={result.get('success')} "
+            f"exit={result.get('exit_code')} in {dt}ms "
+            f"stdout={len(result.get('stdout','') or '')}b stderr={len(result.get('stderr','') or '')}b"
+        )
+
         # Send response
         try:
-            await self._ws.send(json.dumps({
+            payload = json.dumps({
                 "type": "response",
                 "request_id": request_id,
                 "data": result,
-            }))
+            })
+            await self._ws.send(payload)
+            logger.info(f"Response sent for {request_id} ({len(payload)}b)")
         except ConnectionClosed:
             logger.warning(f"Cannot send response for {request_id}: connection closed")
+        except Exception as e:
+            logger.error(f"Failed to send response for {request_id}: {e}", exc_info=True)
 
     async def _dispatch_command(self, command: str, params: dict) -> dict:
         """Dispatch a command to the appropriate executor."""
@@ -305,6 +322,31 @@ class ShellBridgeClient:
                 code=params.get("code", ""),
                 timeout=params.get("timeout", 60),
                 cwd=params.get("cwd", self.cwd),
+            )
+
+        # --- Background jobs (detached; platform polls) ---
+        # Run in a worker thread: bg_cancel can block on taskkill, and none of
+        # these should stall the daemon's event loop.
+        elif command == "shell_bg_start":
+            return await asyncio.to_thread(
+                bg_start,
+                params.get("task_id", ""),
+                params.get("command", ""),
+                params.get("cwd", self.cwd),
+                params.get("timeout", 0),
+            )
+
+        elif command == "shell_bg_poll":
+            return await asyncio.to_thread(
+                bg_poll,
+                params.get("task_id", ""),
+                params.get("offset", 0),
+            )
+
+        elif command == "shell_bg_cancel":
+            return await asyncio.to_thread(
+                bg_cancel,
+                params.get("task_id", ""),
             )
 
         elif command == "file_read":

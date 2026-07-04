@@ -48,6 +48,14 @@ for _s in (sys.stdout, sys.stderr):
 
 HERE = Path(__file__).resolve().parent
 
+# Pack profiles → requirements files (relative to HERE). "base" is the lean web/CLI pack
+# (all wheels, no compiler). "internal-ad" adds impacket/nxc/certipy/... and needs a C +
+# Rust toolchain at build time (netifaces, aardwolf) — build it on manylinux/CI runners.
+PROFILE_REQS = {
+    "base": ["sandbox-requirements.in"],
+    "internal-ad": ["sandbox-requirements.in", "internal-ad-requirements.in"],
+}
+
 
 # --------------------------------------------------------------------------- #
 # platform helpers
@@ -142,11 +150,12 @@ def _under_reparse(path: Path, root: Path) -> bool:
     return False
 
 
-def install_packages(uv: str, pybin: Path, req_in: Path, pack: Path, triple: str) -> Path:
-    """Compile a pinned+hashed lock, then install into the standalone interpreter."""
-    lock = pack / f"sandbox-requirements.{triple}.lock"
+def install_packages(uv: str, pybin: Path, req_ins: list, pack: Path, lock_key: str) -> Path:
+    """Compile a pinned+hashed lock from one or more requirements files, then install
+    into the standalone interpreter."""
+    lock = pack / f"sandbox-requirements.{lock_key}.lock"
     run([uv, "pip", "compile", "--python", str(pybin), "--generate-hashes",
-         "-o", str(lock), str(req_in)])
+         "-o", str(lock), *[str(r) for r in req_ins]])
     # Install straight into the standalone interpreter's own site-packages (the
     # py-app-standalone approach) so the tree stays relocatable — no venv indirection
     # whose pyvenv.cfg would hard-code an absolute base path. uv marks the managed
@@ -201,13 +210,15 @@ def _extract(arc: Path, kind: str, dest: Path) -> None:
             t.extractall(dest)
 
 
-def download_tools(manifest: Path, pack: Path, os_name: str,
-                   arch: str) -> tuple[dict, dict, list]:
-    """Download + install CLI tools for (os,arch). Returns (lock, env, bin_dirs):
+def download_tools(manifest: Path, pack: Path, os_name: str, arch: str,
+                   profile: str = "base") -> tuple[dict, dict, list]:
+    """Download + install CLI tools for (os,arch,profile). Returns (lock, env, bin_dirs):
     lock maps tool -> {version, sha256, binary, …}; env maps runtime var -> pack-relative
     path (e.g. NMAPDIR); bin_dirs are extra pack-relative dirs to prepend to PATH (used by
     'path'-exposed bundles like Windows nmap whose binary needs its adjacent DLLs).
-    Single-binary tools land in bin/; 'bundle' tools extract to share/<dir>/."""
+    Single-binary tools land in bin/; 'bundle' tools extract to share/<dir>/; 'git' tools
+    are cloned to share/<dir>/ with a python launcher in bin/. A tool with a "profiles"
+    list is installed only for those profiles."""
     spec = json.loads(manifest.read_text())
     bindir = pack / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
@@ -218,9 +229,18 @@ def download_tools(manifest: Path, pack: Path, os_name: str,
     exe = ".exe" if os_name == "windows" else ""
     for tool in spec["tools"]:
         name = tool["name"]
+        profs = tool.get("profiles")
+        if profs and profile not in profs:
+            continue   # tool not part of this profile (e.g. AD-only git tools)
         plats = tool.get("platforms")
         if plats and f"{os_name}/{arch}" not in plats:
             print(f"  - {name}: no build for {os_name}/{arch}, skipping")
+            continue
+        if tool.get("kind") == "git":
+            try:
+                lock[name] = _install_git(tool, pack, bindir)
+            except Exception as e:  # noqa: BLE001
+                print(f"    ! {name} (git) failed: {e}")
             continue
         # some tools change container format per-OS (e.g. ffuf ships .zip on Windows)
         archive = tool.get("archive_map", {}).get(os_name, tool["archive"])
@@ -264,6 +284,41 @@ def download_tools(manifest: Path, pack: Path, os_name: str,
         except Exception as e:  # noqa: BLE001 — one tool failing must not fail the pack
             print(f"    ! {name} failed: {e}")
     return lock, env, bin_dirs
+
+
+def _install_git(tool: dict, pack: Path, bindir: Path) -> dict:
+    """Clone a git tool (e.g. Responder, enum4linux-ng) into share/<bundle_dir>/ and drop
+    a launcher in bin/ that runs it with the pack's own python. Its Python deps are
+    expected to already be in the pack (the internal-ad profile pulls netifaces/ldap3/…)."""
+    share = pack / "share" / tool["bundle_dir"]
+    if share.exists():
+        shutil.rmtree(share)
+    share.mkdir(parents=True)
+    ref = tool.get("ref", "HEAD")
+    print(f"  - {tool['name']}: git {tool['repo']}@{ref}")
+    cmd = ["git", "clone", "--depth", "1"]
+    if ref != "HEAD":
+        cmd += ["--branch", ref]
+    run(cmd + [tool["repo"], str(share)], capture_output=True)
+    commit = subprocess.run(["git", "-C", str(share), "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    shutil.rmtree(share / ".git", ignore_errors=True)   # drop VCS metadata from the pack
+
+    launchers = []
+    for binname, script in tool.get("entry", {}).items():
+        launcher = bindir / binname
+        launcher.write_text(
+            "#!/bin/sh\n"
+            'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            'py="$(ls "$d"/python/*/bin/python3 2>/dev/null | head -1)"\n'
+            'exec "$py" "$d/share/%s/%s" "$@"\n' % (tool["bundle_dir"], script)
+        )
+        launcher.chmod(0o755)
+        launchers.append(binname)
+    print(f"    ok git {tool['name']} -> share/{tool['bundle_dir']} @ {commit[:10]} "
+          f"(bin: {', '.join(launchers)})")
+    return {"version": commit[:10], "kind": "git", "repo": tool["repo"], "ref": ref,
+            "commit": commit, "bundle_dir": tool["bundle_dir"], "binaries": launchers}
 
 
 def _install_bundle(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
@@ -416,7 +471,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=str(HERE / "out"), help="output root dir")
     ap.add_argument("--python-version", default="3.12")
-    ap.add_argument("--requirements", default=str(HERE / "sandbox-requirements.in"))
+    ap.add_argument("--profile", default="base", choices=list(PROFILE_REQS),
+                    help="which toolset to bundle (base = web/CLI; internal-ad adds AD tools)")
+    ap.add_argument("--requirements", default=None,
+                    help="override the requirements file(s) for the profile")
     ap.add_argument("--manifest", default=str(HERE / "tools.manifest.json"))
     ap.add_argument("--uv", default=None, help="path to uv binary")
     ap.add_argument("--no-tools", action="store_true", help="skip CLI tool download")
@@ -428,26 +486,31 @@ def main() -> int:
     uv = find_uv(args.uv)
     os_name, arch = detect_os(), detect_arch()
     triple = f"{os_name}-{arch}"
+    # profiled packs get a distinct name/dir so base + internal-ad can coexist
+    pack_name = triple if args.profile == "base" else f"{args.profile}-{triple}"
+    req_ins = ([Path(args.requirements)] if args.requirements
+               else [HERE / r for r in PROFILE_REQS[args.profile]])
     out = Path(args.out).resolve()
-    pack = out / triple
+    pack = out / pack_name
     if pack.exists():
         shutil.rmtree(pack)
     pack.mkdir(parents=True)
 
-    print(f"[1/5] uv={uv}  target={triple}  python={args.python_version}")
+    print(f"[1/5] uv={uv}  target={pack_name}  python={args.python_version}")
+    print(f"      profile={args.profile}  requirements={[r.name for r in req_ins]}")
     print("[2/5] installing standalone python …")
     pybin = install_python(uv, pack, args.python_version)
     print(f"      interpreter: {pybin}")
 
     print("[3/5] installing packages into interpreter …")
-    lockfile = install_packages(uv, pybin, Path(args.requirements), pack, triple)
+    lockfile = install_packages(uv, pybin, req_ins, pack, pack_name)
     relocate_fixup(pack, pybin)
 
     tools_lock, tools_env, tools_bin_dirs = {}, {}, []
     if not args.no_tools:
         print("[4/5] downloading CLI tools …")
         tools_lock, tools_env, tools_bin_dirs = download_tools(
-            Path(args.manifest), pack, os_name, arch)
+            Path(args.manifest), pack, os_name, arch, args.profile)
         (pack / "tools.lock.json").write_text(json.dumps(tools_lock, indent=2))
     else:
         print("[4/5] skipping CLI tools (--no-tools)")
@@ -461,6 +524,7 @@ def main() -> int:
     manifest = {
         "schema": 1,
         "triple": triple,
+        "profile": args.profile,
         "os": os_name,
         "arch": arch,
         "python_version": args.python_version,
@@ -477,10 +541,10 @@ def main() -> int:
     print(f"      packages: {len(manifest['packages'])}  tools: {len(tools_lock)}")
 
     if args.tar:
-        tarpath = out / f"strobes-sandbox-pack-{triple}.tar.gz"
+        tarpath = out / f"strobes-sandbox-pack-{pack_name}.tar.gz"
         print(f"[+] taring -> {tarpath}")
         with tarfile.open(tarpath, "w:gz") as t:
-            t.add(pack, arcname=triple)
+            t.add(pack, arcname=pack_name)
         print(f"    size: {tarpath.stat().st_size / 1e6:.1f} MB")
 
     print(f"\n✅ pack built: {pack}")

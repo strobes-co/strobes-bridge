@@ -52,20 +52,22 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      # Build the sandbox pack for this platform and embed its TARBALL into the binary.
-      # At runtime the binary self-extracts it locally (offline) — no external download.
-      - name: Build sandbox pack
+      # Build the sandbox pack (internal-ad = default toolset) and embed its TARBALL into
+      # the binary. At runtime the binary self-extracts it locally (offline) — no download.
+      # Runners ship Rust + git; ubuntu/macOS/Windows ship a C compiler (aardwolf=Rust,
+      # netifaces=C, Responder/enum4linux-ng=git).
+      - name: Build sandbox pack (internal-ad)
         shell: bash
         run: |
           uv run --python 3.12 python sandbox_pack/build_pack.py \
-            --out sandbox_pack/out --python-version 3.12 --tar
+            --profile internal-ad --out sandbox_pack/out --python-version 3.12 --tar
 
       - name: Build executable (pack embedded)
         run: |
           pyinstaller \
             --onefile \
             --name "${{ matrix.asset_name }}" \
-            --add-data "sandbox_pack/out/strobes-sandbox-pack-${{ matrix.triple }}.tar.gz${{ matrix.sep }}." \
+            --add-data "sandbox_pack/out/strobes-sandbox-pack-internal-ad-${{ matrix.triple }}.tar.gz${{ matrix.sep }}." \
             --hidden-import=strobes_shell_agent \
             --hidden-import=strobes_shell_agent.executor \
             --hidden-import=strobes_shell_agent.client \
@@ -93,20 +95,21 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Build ARM64 binary (pack embedded)
+      - name: Build ARM64 binary (internal-ad pack embedded)
         run: |
           docker run --rm --platform linux/arm64 \
             -v "$PWD:/src" -w /src \
             python:3.12-slim bash -c '
               set -e
-              apt-get update && apt-get install -y --no-install-recommends binutils curl ca-certificates && rm -rf /var/lib/apt/lists/*
-              export HOME=/root PATH=/root/.local/bin:$PATH
+              apt-get update && apt-get install -y --no-install-recommends binutils curl ca-certificates git build-essential pkg-config libffi-dev && rm -rf /var/lib/apt/lists/*
+              export UV_INSTALL_DIR=/usr/local/bin CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:/usr/local/bin:$PATH
               curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+              curl -LsSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path >/dev/null 2>&1
               pip install --no-cache-dir ".[dev]"
-              uv run --python 3.12 python sandbox_pack/build_pack.py --out sandbox_pack/out --python-version 3.12 --tar
+              uv run --python 3.12 python sandbox_pack/build_pack.py --profile internal-ad --out sandbox_pack/out --python-version 3.12 --tar
               pyinstaller --onefile \
                 --name strobes-shell-agent-linux-arm64 \
-                --add-data "sandbox_pack/out/strobes-sandbox-pack-linux-aarch64.tar.gz:." \
+                --add-data "sandbox_pack/out/strobes-sandbox-pack-internal-ad-linux-aarch64.tar.gz:." \
                 --hidden-import=strobes_shell_agent \
                 --hidden-import=strobes_shell_agent.executor \
                 --hidden-import=strobes_shell_agent.client \

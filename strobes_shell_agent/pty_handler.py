@@ -17,6 +17,8 @@ import logging
 import os
 import sys
 
+from strobes_shell_agent import pack
+
 IS_WINDOWS = sys.platform == "win32"
 
 if not IS_WINDOWS:
@@ -60,6 +62,13 @@ class PtySession:
                 shell = candidate
                 break
 
+        # Inject the sandbox pack (nmap/nuclei/... + interpreter, NMAPDIR, nuclei
+        # templates) into the interactive shell's environment so terminals have the
+        # same tooling as workspace_execute_shell_command. Computed in the parent so
+        # the pack's one-time setup runs here, not in the forked child.
+        child_env = dict(pack.build_env())
+        child_env["TERM"] = "xterm-256color"
+
         master_fd, slave_fd = pty.openpty()
         # Set initial terminal size on the slave so SIGWINCH carries.
         try:
@@ -86,12 +95,11 @@ class PtySession:
                 os.dup2(slave_fd, 2)
                 if slave_fd > 2:
                     os.close(slave_fd)
-                os.environ["TERM"] = "xterm-256color"
-                # --login only on shells we know support it
+                # --login only on shells we know support it; exec with the pack env.
                 if shell.endswith(("/bash", "/zsh")):
-                    os.execlp(shell, shell, "--login")
+                    os.execvpe(shell, [shell, "--login"], child_env)
                 else:
-                    os.execlp(shell, shell)
+                    os.execvpe(shell, [shell], child_env)
             except Exception:
                 os._exit(127)
 
@@ -251,8 +259,11 @@ class WindowsPtySession:
 
         shell = self._pick_shell()
         self._loop = asyncio.get_event_loop()
-        # pywinpty takes (rows, cols) as dimensions.
-        self.proc = winpty.PtyProcess.spawn(shell, dimensions=(rows, cols))
+        # pywinpty takes (rows, cols) as dimensions. Pass the pack-augmented env so the
+        # interactive terminal sees nmap/nuclei/... from the sandbox pack.
+        self.proc = winpty.PtyProcess.spawn(
+            shell, dimensions=(rows, cols), env=pack.build_env()
+        )
         self._running = True
         # Drain output on a thread; pywinpty reads are blocking.
         self._reader_future = self._loop.run_in_executor(None, self._reader_loop)
