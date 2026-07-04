@@ -23,3 +23,6 @@ adidnsdump>=1.4           # AD-integrated DNS records
 bloodyAD>=2.0             # live LDAP recon + object edits (add-computer, shadow creds)
 pywerview>=0.6            # PowerView-style LDAP recon from *nix
 lsassy>=3.1               # remote lsass secret extraction (pairs with nxc)
+
+# --- deps for the git-bundled tools (Responder etc.; enum4linux-ng uses ldap3/impacket) ---
+aioquic>=1.0              # required by Responder (QUIC rogue server)

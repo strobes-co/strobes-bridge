@@ -210,13 +210,15 @@ def _extract(arc: Path, kind: str, dest: Path) -> None:
             t.extractall(dest)
 
 
-def download_tools(manifest: Path, pack: Path, os_name: str,
-                   arch: str) -> tuple[dict, dict, list]:
-    """Download + install CLI tools for (os,arch). Returns (lock, env, bin_dirs):
+def download_tools(manifest: Path, pack: Path, os_name: str, arch: str,
+                   profile: str = "base") -> tuple[dict, dict, list]:
+    """Download + install CLI tools for (os,arch,profile). Returns (lock, env, bin_dirs):
     lock maps tool -> {version, sha256, binary, …}; env maps runtime var -> pack-relative
     path (e.g. NMAPDIR); bin_dirs are extra pack-relative dirs to prepend to PATH (used by
     'path'-exposed bundles like Windows nmap whose binary needs its adjacent DLLs).
-    Single-binary tools land in bin/; 'bundle' tools extract to share/<dir>/."""
+    Single-binary tools land in bin/; 'bundle' tools extract to share/<dir>/; 'git' tools
+    are cloned to share/<dir>/ with a python launcher in bin/. A tool with a "profiles"
+    list is installed only for those profiles."""
     spec = json.loads(manifest.read_text())
     bindir = pack / "bin"
     bindir.mkdir(parents=True, exist_ok=True)
@@ -227,9 +229,18 @@ def download_tools(manifest: Path, pack: Path, os_name: str,
     exe = ".exe" if os_name == "windows" else ""
     for tool in spec["tools"]:
         name = tool["name"]
+        profs = tool.get("profiles")
+        if profs and profile not in profs:
+            continue   # tool not part of this profile (e.g. AD-only git tools)
         plats = tool.get("platforms")
         if plats and f"{os_name}/{arch}" not in plats:
             print(f"  - {name}: no build for {os_name}/{arch}, skipping")
+            continue
+        if tool.get("kind") == "git":
+            try:
+                lock[name] = _install_git(tool, pack, bindir)
+            except Exception as e:  # noqa: BLE001
+                print(f"    ! {name} (git) failed: {e}")
             continue
         # some tools change container format per-OS (e.g. ffuf ships .zip on Windows)
         archive = tool.get("archive_map", {}).get(os_name, tool["archive"])
@@ -273,6 +284,41 @@ def download_tools(manifest: Path, pack: Path, os_name: str,
         except Exception as e:  # noqa: BLE001 — one tool failing must not fail the pack
             print(f"    ! {name} failed: {e}")
     return lock, env, bin_dirs
+
+
+def _install_git(tool: dict, pack: Path, bindir: Path) -> dict:
+    """Clone a git tool (e.g. Responder, enum4linux-ng) into share/<bundle_dir>/ and drop
+    a launcher in bin/ that runs it with the pack's own python. Its Python deps are
+    expected to already be in the pack (the internal-ad profile pulls netifaces/ldap3/…)."""
+    share = pack / "share" / tool["bundle_dir"]
+    if share.exists():
+        shutil.rmtree(share)
+    share.mkdir(parents=True)
+    ref = tool.get("ref", "HEAD")
+    print(f"  - {tool['name']}: git {tool['repo']}@{ref}")
+    cmd = ["git", "clone", "--depth", "1"]
+    if ref != "HEAD":
+        cmd += ["--branch", ref]
+    run(cmd + [tool["repo"], str(share)], capture_output=True)
+    commit = subprocess.run(["git", "-C", str(share), "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip()
+    shutil.rmtree(share / ".git", ignore_errors=True)   # drop VCS metadata from the pack
+
+    launchers = []
+    for binname, script in tool.get("entry", {}).items():
+        launcher = bindir / binname
+        launcher.write_text(
+            "#!/bin/sh\n"
+            'd="$(cd "$(dirname "$0")/.." && pwd)"\n'
+            'py="$(ls "$d"/python/*/bin/python3 2>/dev/null | head -1)"\n'
+            'exec "$py" "$d/share/%s/%s" "$@"\n' % (tool["bundle_dir"], script)
+        )
+        launcher.chmod(0o755)
+        launchers.append(binname)
+    print(f"    ok git {tool['name']} -> share/{tool['bundle_dir']} @ {commit[:10]} "
+          f"(bin: {', '.join(launchers)})")
+    return {"version": commit[:10], "kind": "git", "repo": tool["repo"], "ref": ref,
+            "commit": commit, "bundle_dir": tool["bundle_dir"], "binaries": launchers}
 
 
 def _install_bundle(tool: dict, arc: Path, pack: Path, bindir: Path, exe: str,
@@ -464,7 +510,7 @@ def main() -> int:
     if not args.no_tools:
         print("[4/5] downloading CLI tools …")
         tools_lock, tools_env, tools_bin_dirs = download_tools(
-            Path(args.manifest), pack, os_name, arch)
+            Path(args.manifest), pack, os_name, arch, args.profile)
         (pack / "tools.lock.json").write_text(json.dumps(tools_lock, indent=2))
     else:
         print("[4/5] skipping CLI tools (--no-tools)")
