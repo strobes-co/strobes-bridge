@@ -22,6 +22,9 @@ from strobes_shell_agent.executor import (
     upload_file,
     download_file,
     get_env_info,
+    bg_start,
+    bg_poll,
+    bg_cancel,
 )
 from strobes_shell_agent.pty_handler import (
     handle_pty_open,
@@ -179,6 +182,8 @@ class ShellBridgeClient:
                 "python": platform.python_version(),
                 "agent_version": "0.1.0",
                 "pack": pack.status(),
+                # Capabilities the platform can rely on for this daemon.
+                "features": ["bg_exec"],
             },
         }))
 
@@ -317,6 +322,31 @@ class ShellBridgeClient:
                 code=params.get("code", ""),
                 timeout=params.get("timeout", 60),
                 cwd=params.get("cwd", self.cwd),
+            )
+
+        # --- Background jobs (detached; platform polls) ---
+        # Run in a worker thread: bg_cancel can block on taskkill, and none of
+        # these should stall the daemon's event loop.
+        elif command == "shell_bg_start":
+            return await asyncio.to_thread(
+                bg_start,
+                params.get("task_id", ""),
+                params.get("command", ""),
+                params.get("cwd", self.cwd),
+                params.get("timeout", 0),
+            )
+
+        elif command == "shell_bg_poll":
+            return await asyncio.to_thread(
+                bg_poll,
+                params.get("task_id", ""),
+                params.get("offset", 0),
+            )
+
+        elif command == "shell_bg_cancel":
+            return await asyncio.to_thread(
+                bg_cancel,
+                params.get("task_id", ""),
             )
 
         elif command == "file_read":

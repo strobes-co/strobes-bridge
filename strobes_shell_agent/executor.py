@@ -7,6 +7,7 @@ import platform
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,6 +17,16 @@ from typing import Optional
 from strobes_shell_agent import pack
 
 IS_WINDOWS = sys.platform == "win32"
+
+# Detached-process flags used by the background executor. CREATE_NEW_PROCESS_GROUP
+# lets ``taskkill /T`` reach the whole tree; DETACHED_PROCESS frees it from the
+# daemon's console so it outlives a daemon restart.
+_WIN_DETACHED_FLAGS = 0x00000200 | 0x00000008  # CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
+
+# How long a *finished* background job is retained (output + registry entry)
+# after termination so late polls / read_tail still succeed. Swept on the next
+# bg_start. 1h mirrors the platform's per-row lifetime.
+_BG_FINISHED_TTL_S = 3600
 
 
 async def execute_shell_command(
@@ -103,6 +114,200 @@ def _kill_proc_group(proc):
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Background jobs
+#
+# The platform's bg-shell daemon polls, so the bridge must launch a command
+# DETACHED and answer start / poll / cancel. All OS differences live here in
+# Python (process-group flags, tree-kill) — the platform never generates a
+# shell launcher. Output streams to files in a per-task tempdir so polls read
+# incrementally without touching the child's pipes.
+# ---------------------------------------------------------------------------
+
+# task_id -> {"proc": Popen, "workdir": Path, "deadline": float|None,
+#             "finished_at": float|None}
+_BG_JOBS: dict = {}
+
+
+def _bg_root() -> Path:
+    root = Path(tempfile.gettempdir()) / "strobes-bg"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _kill_bg_proc(proc: "subprocess.Popen") -> None:
+    """Kill a detached background process and its whole tree, cross-OS."""
+    if proc.poll() is not None:
+        return
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    time.sleep(0.3)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _sweep_finished_jobs() -> None:
+    now = time.monotonic()
+    for tid in list(_BG_JOBS.keys()):
+        job = _BG_JOBS.get(tid)
+        if not job:
+            continue
+        fin = job.get("finished_at")
+        if fin is not None and (now - fin) > _BG_FINISHED_TTL_S:
+            shutil.rmtree(job["workdir"], ignore_errors=True)
+            _BG_JOBS.pop(tid, None)
+
+
+def bg_start(
+    task_id: str,
+    command: str,
+    cwd: Optional[str] = None,
+    timeout: int = 0,
+) -> dict:
+    """Launch ``command`` detached and return immediately.
+
+    Returns ``{success, task_id, pid, workdir}``. stdout/stderr stream to files
+    under a per-task tempdir; poll with :func:`bg_poll`.
+    """
+    if not task_id or not command:
+        return {"success": False, "error": "task_id and command are required"}
+    _sweep_finished_jobs()
+    if task_id in _BG_JOBS:
+        return {"success": False, "error": f"task {task_id} already exists"}
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
+
+    workdir = _bg_root() / str(task_id)
+    workdir.mkdir(parents=True, exist_ok=True)
+    out_f = open(workdir / "stdout", "wb")
+    err_f = open(workdir / "stderr", "wb")
+
+    popen_kwargs = {
+        "stdout": out_f,
+        "stderr": err_f,
+        "stdin": subprocess.DEVNULL,
+        "cwd": cwd,
+        "env": pack.build_env(),
+        "shell": True,
+    }
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = _WIN_DETACHED_FLAGS
+    else:
+        # New session → the child leads its own process group so we can
+        # signal the whole tree on cancel/timeout.
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        proc = subprocess.Popen(command, **popen_kwargs)
+    except Exception as e:
+        out_f.close()
+        err_f.close()
+        shutil.rmtree(workdir, ignore_errors=True)
+        return {"success": False, "error": str(e)}
+
+    _BG_JOBS[task_id] = {
+        "proc": proc,
+        "workdir": workdir,
+        "out_f": out_f,
+        "err_f": err_f,
+        "deadline": (time.monotonic() + timeout) if timeout and timeout > 0 else None,
+        "finished_at": None,
+    }
+    return {
+        "success": True,
+        "task_id": task_id,
+        "pid": proc.pid,
+        "workdir": str(workdir),
+    }
+
+
+def _read_from(path: Path, offset: int) -> tuple[str, int]:
+    """Return (new_text_since_offset, total_size)."""
+    try:
+        if not path.exists():
+            return "", 0
+        total = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, int(offset)))
+            data = f.read()
+        return data.decode(errors="replace"), total
+    except OSError:
+        return "", 0
+
+
+def bg_poll(task_id: str, offset: int = 0) -> dict:
+    """Poll a background job. Returns status + stdout bytes since ``offset``."""
+    job = _BG_JOBS.get(task_id)
+    if not job:
+        # Unknown or already swept — the platform treats this as lost/gone.
+        return {"success": True, "found": False, "running": False, "exit_code": None}
+
+    proc = job["proc"]
+    rc = proc.poll()
+
+    # Belt-and-braces daemon-side timeout (the platform also cancels via its
+    # own per-row deadline). Prevents orphans if the platform disconnects.
+    timed_out = False
+    if rc is None and job["deadline"] is not None and time.monotonic() > job["deadline"]:
+        _kill_bg_proc(proc)
+        rc = proc.poll()
+        timed_out = True
+
+    running = rc is None
+    new_stdout, total = _read_from(job["workdir"] / "stdout", offset)
+
+    if not running and job.get("finished_at") is None:
+        job["finished_at"] = time.monotonic()
+        for k in ("out_f", "err_f"):
+            try:
+                job[k].close()
+            except Exception:
+                pass
+
+    return {
+        "success": True,
+        "found": True,
+        "running": running,
+        "exit_code": (124 if timed_out and rc is None else rc),
+        "timed_out": timed_out,
+        "stdout": new_stdout,
+        "stdout_size": total,
+        "pid": proc.pid,
+    }
+
+
+def bg_cancel(task_id: str) -> dict:
+    """Kill a background job and clean up its workdir."""
+    job = _BG_JOBS.pop(task_id, None)
+    if not job:
+        return {"success": True, "found": False}
+    _kill_bg_proc(job["proc"])
+    for k in ("out_f", "err_f"):
+        try:
+            job[k].close()
+        except Exception:
+            pass
+    shutil.rmtree(job["workdir"], ignore_errors=True)
+    return {"success": True, "found": True}
 
 
 async def execute_code(
