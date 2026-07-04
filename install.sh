@@ -13,6 +13,16 @@ set -euo pipefail
 
 REPO="strobes-co/strobes-bridge"
 BIN_NAME="strobes-shell-agent"
+
+# Where to fetch the binary from. When this installer is served by a Strobes
+# tenant (AI → Shells → one-line install), the tenant's install-script proxy
+# rewrites the token below to its own same-origin download endpoint, so the
+# executable is pulled from the tenant too — no GitHub dependency, works behind
+# proxies that block GitHub. Left untouched (still the token) when the script is
+# fetched directly from GitHub raw, in which case we fall back to GitHub Releases.
+DOWNLOAD_BASE="__STROBES_DOWNLOAD_BASE__"
+case "$DOWNLOAD_BASE" in *__STROBES_DOWNLOAD_BASE__*) DOWNLOAD_BASE="" ;; esac
+
 UNINSTALL=0
 WITH_SERVICE=1
 for arg in "$@"; do
@@ -65,7 +75,12 @@ if [ "$UNINSTALL" = 1 ]; then
 fi
 
 # --- download ----------------------------------------------------------------
-URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+if [ -n "$DOWNLOAD_BASE" ]; then
+  # Tenant proxy: {tenant}/api/v1/organizations/{org}/ai/bridge/download/?asset=…
+  case "$DOWNLOAD_BASE" in *\?*) URL="${DOWNLOAD_BASE}&asset=${ASSET}" ;; *) URL="${DOWNLOAD_BASE}?asset=${ASSET}" ;; esac
+else
+  URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+fi
 c_blue "Downloading ${ASSET}…"
 TMP="$(mktemp)"
 curl -fSL --progress-bar "$URL" -o "$TMP" || die "download failed: $URL"

@@ -38,7 +38,8 @@ for _s in (sys.stdout, sys.stderr):
 IMPORTS = {
     "baseline": ["boto3", "botocore", "requests", "paramiko", "urllib3", "certifi", "yaml"],
     "native": ["curl_cffi", "cryptography", "lxml.etree", "PIL", "zstandard"],
-    "report": ["reportlab", "pypdf", "pdfplumber", "docx", "pptx", "defusedxml"],
+    "report": ["reportlab", "pypdf", "pdfplumber", "docx", "pptx", "defusedxml",
+               "openpyxl", "xlsxwriter", "jinja2", "tabulate", "pandas", "markitdown"],
 }
 
 FUNCTIONAL = r"""
