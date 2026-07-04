@@ -69,6 +69,52 @@ jobs:
           name: sandbox-pack-linux-${{ matrix.arch }}
           path: sandbox_pack/out/strobes-sandbox-pack-linux-${{ matrix.arch }}.tar.gz
 
+  # Internal-network + Active Directory pack (impacket/nxc/certipy/responder/…). Needs a
+  # C + Rust toolchain (netifaces, aardwolf); manylinux has gcc, we add git + rust. Linux
+  # only for now — macOS/Windows AD builds (aardwolf Rust + netifaces) need runner validation.
+  internal-ad-linux:
+    name: internal-ad-linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build internal-ad pack in ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD/sandbox_pack":/src:ro -v "$PWD/sandbox_pack/out":/out \
+            ${{ matrix.image }} bash -lc '
+              set -e
+              command -v git >/dev/null || yum install -y git >/dev/null 2>&1
+              export HOME=/root PATH=/root/.local/bin:/root/.cargo/bin:$PATH
+              curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+              curl -LsSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
+              uv run --python 3.12 python /src/build_pack.py --profile internal-ad --out /out \
+                --manifest /src/tools.manifest.json --python-version 3.12 --tar
+            '
+      - name: Validate internal-ad pack (offline) on Rocky 8
+        run: |
+          PACK=out/internal-ad-linux-${{ matrix.arch }}
+          PY=$(ls sandbox_pack/$PACK/python/*/bin/python3)
+          docker run --rm --network none -v "$PWD/sandbox_pack":/w:ro rockylinux:8 bash -lc "
+            \$(ls /w/$PACK/python/*/bin/python3) /w/test_pack.py --pack /w/$PACK --skip-relocate
+            for t in nxc certipy bloodhound-python responder enum4linux-ng; do
+              /w/$PACK/python/*/bin/python3 -c 'import shutil,sys; sys.exit(0)' ;
+            done
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-pack-internal-ad-linux-${{ matrix.arch }}
+          path: sandbox_pack/out/strobes-sandbox-pack-internal-ad-linux-${{ matrix.arch }}.tar.gz
+
   native:
     name: ${{ matrix.triple }}
     runs-on: ${{ matrix.runner }}
@@ -142,7 +188,7 @@ jobs:
             sandbox_pack/out/strobes-sandbox-pack-macos-x86_64.tar.gz.sha256
 
   publish:
-    needs: [linux, native]
+    needs: [linux, internal-ad-linux, native]
     runs-on: ubuntu-latest
     # Publish whatever packs built. !cancelled() lets a slow/failed leg (e.g. the scarce
     # Intel-mac runner) not sink the release; re-running that job later re-publishes it.
