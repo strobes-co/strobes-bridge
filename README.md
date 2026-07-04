@@ -34,11 +34,33 @@ Go to **AI > Shells > Create Shell**, select **Bridge** type, and note the `brid
 
 Go to **Settings > API Keys** and copy your key.
 
-### 3. Run the agent
+### 3. Install the agent
 
-**Option A: Pre-built binary (recommended, no Python needed)**
+**Option A: One-line install (recommended)** — downloads the binary (sandbox pack
+embedded: nmap/nuclei/… run offline), walks you through setup, and registers a service
+that starts on boot.
 
-Download from [Releases](https://github.com/strobes-co/strobes-agent-shell/releases):
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/strobes-co/strobes-bridge/main/install.sh | bash
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/strobes-co/strobes-bridge/main/install.ps1 | iex
+```
+
+Non-interactive (CI/automation): set `STROBES_URL`, `STROBES_API_KEY`, `STROBES_ORG_ID`
+in the environment first. Manage the service afterwards:
+
+| | Linux (systemd) | macOS (launchd) | Windows (task) |
+|---|---|---|---|
+| start/stop | `systemctl --user start\|stop co.strobes.shell-agent` | `launchctl load\|unload -w ~/Library/LaunchAgents/co.strobes.shell-agent.plist` | `Start\|Stop-ScheduledTask -TaskName StrobesShellAgent` |
+| verify tools | `strobes-shell-agent selftest` | same | same |
+| uninstall | `install.sh \| bash -s -- --uninstall` | same | `$env:STROBES_UNINSTALL='1'; irm …/install.ps1 \| iex` |
+
+**Option B: Pre-built binary (manual, no Python needed)**
+
+Download from [Releases](https://github.com/strobes-co/strobes-bridge/releases):
 
 ```bash
 # Linux
