@@ -23,8 +23,8 @@ from strobes_shell_agent.executor import (
     read_file,
     write_file,
     list_files,
-    upload_file,
-    download_file,
+    file_pull,
+    file_push,
     get_env_info,
     bg_start,
     bg_poll,
@@ -451,14 +451,25 @@ class ShellBridgeClient:
                 recursive=params.get("recursive", False),
             )
 
-        elif command == "file_upload":
-            return upload_file(
-                path=params.get("path", ""),
-                content_b64=params.get("content_b64", ""),
+        elif command == "file_pull":
+            # workspace -> machine, via one-time presigned S3 GET
+            return await asyncio.to_thread(
+                file_pull,
+                params.get("path", ""),
+                params.get("url", ""),
+                params.get("sha256"),
+                params.get("timeout", 300),
             )
 
-        elif command == "file_download":
-            return download_file(params.get("path", ""))
+        elif command == "file_push":
+            # machine -> workspace, via one-time presigned S3 PUT
+            return await asyncio.to_thread(
+                file_push,
+                params.get("path", ""),
+                params.get("url", ""),
+                params.get("content_type", "application/octet-stream"),
+                params.get("timeout", 300),
+            )
 
         elif command == "env_info":
             return get_env_info()
