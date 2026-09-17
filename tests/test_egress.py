@@ -692,40 +692,54 @@ def test_l3_nmap_reports_the_truth_in_scope_and_is_blocked_out_of_scope():
         srv.close()
 
 
-def test_raw_socket_tools_are_detected_in_every_command_position():
-    assert sb._raw_socket_tool("nmap -sT 1.2.3.4") == "nmap"
-    assert sb._raw_socket_tool("/usr/bin/nmap -sS x") == "nmap"
-    assert sb._raw_socket_tool("sudo nmap 1.2.3.4") == "nmap"      # through a wrapper
-    assert sb._raw_socket_tool("echo hi | nmap -p80 1.2.3.4") == "nmap"  # after a pipe
-    assert sb._raw_socket_tool("curl http://x") is None
-    assert sb._raw_socket_tool("nmapx --foo") is None               # not a prefix match
-    # An argument that merely mentions a tool is not an invocation of it.
-    assert sb._raw_socket_tool("curl http://host/nmap") is None
+# ---------------------------------------------------------------------------
+# Lane capabilities
+#
+# What a lane can carry is a property of the lane, not something to be guessed
+# from the text of a command. Callers need it to interpret results: a port
+# scanner under the proxy lane reaches nothing and reports every port filtered,
+# so raw_sockets=false is the fact that makes that output meaningless.
+# ---------------------------------------------------------------------------
+
+def test_capabilities_describe_the_lane_not_the_command():
+    proxy = sb.capabilities("proxy")
+    assert proxy["raw_sockets"] is False and proxy["udp"] is False
+    assert "not trustworthy" in proxy["note"]
+
+    l3 = sb.capabilities("l3")
+    assert l3["raw_sockets"] is True and l3["udp"] is True
+    assert l3["enforced_at"] == "packet"
 
 
-@pytest.mark.asyncio
-@pytest.mark.skipif(l3lane.available(), reason="only applies to the proxy lane")
 @needs_sandbox
-async def test_proxy_lane_refuses_a_scanner_instead_of_returning_fiction():
-    """The failure mode this guard exists for.
-
-    Run under the proxy lane, nmap cannot reach anything but still exits 0 and
-    reports every port as 'filtered'. An agent writes that into a report as a
-    finding about the target. Refusing is the only honest answer.
-    """
-    result = await sb.get_lane().run_shell("nmap -sT 127.0.0.1", timeout=20)
-    assert result["success"] is False
-    assert result["error"] == "raw_socket_tool_unsupported"
-    assert result["tool"] == "nmap"
-    assert "filtered" in result["stderr"]   # says *why*, not just "no"
+@pytest.mark.asyncio
+async def test_every_result_carries_the_lane_that_produced_it():
+    """So a caller can interpret output without knowing which host it ran on."""
+    result = await sb.get_lane().run_shell("echo hi", timeout=20)
+    assert result["lane"]["mode"] in ("proxy", "l3")
+    assert isinstance(result["lane"]["raw_sockets"], bool)
     await sb.get_lane().stop()
+
+
+@needs_sandbox
+@pytest.mark.asyncio
+async def test_selftest_verifies_the_capability_claim_against_the_host():
+    """The claim is measured, not asserted.
+
+    A lane that advertised raw_sockets wrongly would have callers trusting
+    scanner output that means nothing, so selftest probes with a real socket
+    and fails if the advertisement does not match.
+    """
+    report = await sb.selftest()
+    assert report["capabilities_verified"] is True, report
+    assert report["raw_sockets"] == sb.capabilities(report["mode"])["raw_sockets"]
 
 
 @needs_l3
 @pytest.mark.asyncio
 async def test_packet_filter_lane_runs_scanners_normally():
-    """The counterpart: where scope can be enforced on packets, nmap just runs."""
+    """Where scope is enforced on packets, nmap just runs — nothing intercepts it."""
     result = await sb.get_lane().run_shell("nmap --version", timeout=30)
-    assert result.get("error") != "raw_socket_tool_unsupported"
     assert "Nmap version" in result["stdout"], result
+    assert result["lane"]["raw_sockets"] is True
     await sb.get_lane().stop()

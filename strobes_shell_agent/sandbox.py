@@ -55,38 +55,6 @@ def _result(success: bool, stdout: str = "", stderr: str = "", exit_code: int = 
     return out
 
 
-#: Tools that work by opening raw sockets, and so cannot function through a
-#: proxy at all. This is a compatibility fact, not a policy: under the proxy
-#: lane the sandbox blocks their probes and they report every port as
-#: ``filtered`` — plausible, professional-looking, and wrong. Refusing is the
-#: only honest answer, because a false negative in a scan is worse than an
-#: error. They work normally in the packet-filter lane.
-RAW_SOCKET_TOOLS = frozenset({
-    "nmap", "masscan", "naabu", "zmap", "unicornscan", "hping3", "arp-scan",
-    "traceroute", "ping", "fping",
-})
-
-
-def _raw_socket_tool(command: str) -> Optional[str]:
-    """The first raw-socket tool invoked by ``command``, if any.
-
-    Looks at every position a command can start — after a pipe, a semicolon, a
-    boolean operator — because ``echo x | nmap ...`` is still an nmap run.
-    """
-    import re
-    for segment in re.split(r"[|;&]+|\$\(|`", command):
-        for token in segment.split():
-            if token.startswith("-"):
-                continue
-            name = os.path.basename(token).lower()
-            if name in ("sudo", "env", "time", "nohup", "stdbuf"):
-                continue  # a wrapper; keep looking at the real command
-            if name in RAW_SOCKET_TOOLS:
-                return name
-            break  # first real word of the segment decides
-    return None
-
-
 class Lane:
     """Owns the proxy and the sandbox, and runs commands through both."""
 
@@ -214,25 +182,6 @@ class Lane:
         if cwd and not os.path.isdir(cwd):
             cwd = None
 
-        # Under the proxy lane a scanner cannot reach anything, but it does not
-        # fail — it reports every port as filtered. Refuse rather than hand back
-        # results that look real.
-        if self._l3_uid is None:
-            tool = _raw_socket_tool(command)
-            if tool:
-                return _result(
-                    False,
-                    stderr=(
-                        f"{tool} needs raw sockets, which this host cannot "
-                        f"enforce scope on, so it is refused rather than run: "
-                        f"it would report every port as filtered whether or not "
-                        f"the target is in scope. Packet-level enforcement "
-                        f"(Linux with CAP_NET_ADMIN) runs it normally."
-                    ),
-                    exit_code=-1, start=start, error="raw_socket_tool_unsupported",
-                    tool=tool,
-                )
-
         if self._proxy is not None:
             self._proxy.denials.clear()
 
@@ -269,7 +218,7 @@ class Lane:
         retarget instead of retrying blindly.
         """
         denials = self._proxy.drain_denials() if self._proxy is not None else []
-        extra = {}
+        extra = {"lane": capabilities(self.mode)}
         if denials:
             extra["egress_denied"] = denials
             note = "; ".join(
@@ -442,6 +391,49 @@ def adopt_path(path: str) -> None:
         pass
 
 
+def capabilities(mode: Optional[str] = None) -> dict:
+    """What traffic this lane can carry.
+
+    A property of the lane, not of any particular command. The proxy lane
+    carries what a tool hands to a SOCKS or HTTP proxy, which is TCP and nothing
+    else; the packet-filter lane sits below the socket layer, so everything a
+    normal process can do works and is still scoped.
+
+    This is what a caller needs in order to interpret results correctly. A port
+    scanner run under the proxy lane reaches nothing and reports every port as
+    filtered — so ``raw_sockets: false`` is the fact that makes that output
+    meaningless, and it is stated up front rather than inferred afterwards from
+    the command that produced it.
+
+    :func:`selftest` verifies these claims against the running host rather than
+    trusting them.
+    """
+    if mode is None:
+        mode = _lane.mode if _lane is not None else (
+            "l3" if l3lane.available() else "proxy")
+    if mode == "l3":
+        return {
+            "mode": "l3",
+            "enforced_at": "packet",
+            "raw_sockets": True,
+            "udp": True,
+            "icmp": True,
+            "note": "scope is enforced on packets, so tools use ordinary sockets",
+        }
+    return {
+        "mode": "proxy",
+        "enforced_at": "socket",
+        "raw_sockets": False,
+        "udp": False,
+        "icmp": False,
+        "note": (
+            "only TCP through the proxy leaves this host. Tools that open raw "
+            "sockets (port scanners, ping, traceroute) reach nothing and will "
+            "report misleading results — their output is not trustworthy here"
+        ),
+    }
+
+
 def describe_policy() -> dict:
     """What is enforced right now — for the CLI banner and the platform."""
     p = _current_policy()
@@ -453,6 +445,7 @@ def describe_policy() -> dict:
         "enforced": not p.is_open,
         "mode": _lane.mode if _lane is not None else (
             "l3" if l3lane.available() else "proxy"),
+        "capabilities": capabilities(),
         "sandbox": procsandbox.describe(),
         "l3": l3lane.status(),
     }
@@ -504,12 +497,32 @@ async def selftest() -> dict:
         denials = [d for d in (denied_run.get("egress_denied") or [])
                    if d.get("host") == blackhole]
 
-        ok = reachable and not reached_blackhole
+        # Verify the lane's advertised capability instead of trusting it. A raw
+        # socket does not consult proxy settings, so this distinguishes the two
+        # lanes by what the host actually permits: under the proxy lane it must
+        # be refused, under the packet filter it must work for an in-scope
+        # destination. Getting this wrong in either direction means callers
+        # cannot interpret scanner output correctly.
+        probe = await lane.run_shell(
+            "python3 -c \"import socket,sys;"
+            "s=socket.socket();s.settimeout(4);"
+            f"s.connect(('127.0.0.1',{port}));print('DIRECT_OK')\" 2>&1 "
+            "|| echo DIRECT_BLOCKED", timeout=25)
+        direct_ok = "DIRECT_OK" in (probe.get("stdout") or "")
+        claimed = capabilities(lane.mode)["raw_sockets"]
+        capability_matches = (direct_ok == claimed)
+
+        ok = reachable and not reached_blackhole and capability_matches
         if not reachable:
             detail = ("SANDBOX IS NOT PASSING TRAFFIC — an allowed destination was "
                       "unreachable, so the refusal below proves nothing")
         elif reached_blackhole:
             detail = "OUT-OF-SCOPE DESTINATION WAS REACHABLE — egress is not enforced"
+        elif not capability_matches:
+            detail = (f"LANE MISREPORTS ITSELF — advertises raw_sockets="
+                      f"{claimed} but a direct socket "
+                      f"{'succeeded' if direct_ok else 'was refused'}; callers "
+                      f"cannot interpret results correctly")
         elif denials:
             detail = f"in-scope reachable; out-of-scope refused: {denials[0]['reason']}"
         else:
@@ -521,6 +534,8 @@ async def selftest() -> dict:
             "backend": procsandbox.detect_backend(),
             "detail": detail,
             "allowed_reachable": reachable,
+            "raw_sockets": direct_ok,
+            "capabilities_verified": capability_matches,
             "denied": denials,
         }
     except SandboxUnavailable as e:
