@@ -46,9 +46,9 @@ jobs:
           strobes-shell-agent connect --help
         shell: bash
 
-      - name: Install bubblewrap (Linux egress sandbox)
+      - name: Install Linux egress tooling
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap nftables nmap libcap2-bin
 
       - name: Test
         run: pytest tests/ -v --tb=short
@@ -76,9 +76,13 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      - name: Install bubblewrap
+      - name: Install Linux egress tooling
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap nftables nmap libcap2-bin
+
+      - name: Verify packet-level enforcement (runs real nmap)
+        if: runner.os == 'Linux'
+        run: sudo -E env "PATH=$PATH" python -m pytest tests/test_egress.py -v -k l3
 
       - name: Provision the Windows sandbox account
         if: runner.os == 'Windows'

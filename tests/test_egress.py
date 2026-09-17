@@ -14,6 +14,8 @@ is required. Tests needing a sandbox backend skip where there is none.
 """
 
 import asyncio
+import os
+import shutil
 import sys
 
 import pytest
@@ -209,7 +211,10 @@ def test_no_backend_means_refusing_to_run_not_running_unconfined(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_lane_reports_sandbox_unavailable_rather_than_executing(monkeypatch):
+    # Both enforcement modes must be unavailable, or the lane legitimately
+    # falls back to the other one.
     monkeypatch.setattr(procsandbox, "detect_backend", lambda: None)
+    monkeypatch.setattr(l3lane, "available", lambda: False)
     lane = sb.Lane(NetworkPolicy.from_lists(default_egress="deny"))
     result = await lane.run_shell("echo should-not-run", timeout=10)
     assert result["success"] is False
@@ -586,6 +591,141 @@ async def test_confine_refuses_rather_than_returning_a_bare_command(monkeypatch)
     is precisely the traffic a scope exists to bound.
     """
     monkeypatch.setattr(procsandbox, "detect_backend", lambda: None)
+    monkeypatch.setattr(l3lane, "available", lambda: False)
     sb._lane = None
     with pytest.raises(sb.SandboxUnavailable):
         sb.confine("curl http://example.com")
+
+
+# ---------------------------------------------------------------------------
+# Packet-level lane
+#
+# The lane that makes scanners work. A proxy cannot carry a raw SYN, so under
+# the proxy lane nmap reports every port as filtered whether or not the target
+# is in scope — confident, wrong answers. Filtering packets instead means the
+# tool uses ordinary sockets and the kernel decides.
+# ---------------------------------------------------------------------------
+
+from strobes_shell_agent import l3lane  # noqa: E402
+
+needs_l3 = pytest.mark.skipif(not l3lane.available(),
+                              reason="needs Linux with CAP_NET_ADMIN")
+
+
+def test_l3_module_is_import_safe_off_linux():
+    assert isinstance(l3lane.available(), bool)
+    assert l3lane.status()["account"] == "strobes-scan"
+
+
+def test_l3_ruleset_lets_the_bridge_keep_its_own_network():
+    """The bridge must survive its own rules, or it cannot report results."""
+    nft = NetworkPolicy.from_lists(allow=["1.2.3.4"]).resolve().to_nftables(uid=4242)
+    assert "meta skuid != 4242 accept" in nft
+
+
+def test_l3_environment_strips_proxy_variables():
+    """Leftover proxy settings would point tools at a proxy that is not running.
+
+    The whole point of this lane is that tools use real sockets.
+    """
+    env = l3lane.environment({"ALL_PROXY": "socks5h://127.0.0.1:1", "PATH": "/bin"})
+    assert "ALL_PROXY" not in env
+    # nmap checks euid rather than its capabilities, so it needs telling that a
+    # non-root uid holding CAP_NET_RAW may raw-scan.
+    assert env["NMAP_PRIVILEGED"] == "1"
+
+
+def test_l3_wrap_drops_privilege_without_a_login_shell():
+    """Identity is what the rules key on, so nothing may re-elevate in between."""
+    argv = l3lane.wrap_shell("echo hi", uid=4242)
+    assert argv[0] in ("setpriv", "runuser", "su")
+    if argv[0] == "setpriv":
+        assert "--reuid" in argv and "4242" in argv
+
+
+@needs_l3
+def test_l3_nmap_reports_the_truth_in_scope_and_is_blocked_out_of_scope():
+    """The whole reason this lane exists, asserted against real nmap."""
+    import socket as _socket
+    import subprocess
+    import threading
+
+    if shutil.which("nmap") is None:
+        pytest.skip("nmap not installed")
+
+    def serve(sock):
+        while True:
+            try:
+                c, _ = sock.accept()
+                c.close()
+            except OSError:
+                return
+
+    srv = _socket.socket()
+    srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(16)
+    threading.Thread(target=serve, args=(srv,), daemon=True).start()
+
+    uid = l3lane.ensure_account()
+    l3lane.grant_raw_capabilities()
+    try:
+        # Loopback is not carved out, so it must be named to be reachable.
+        l3lane.apply_policy(
+            NetworkPolicy.from_lists(allow=["127.0.0.1"], default_egress="deny"), uid)
+        env = l3lane.environment({"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        out = subprocess.run(
+            l3lane.wrap_shell(f"nmap -Pn -sT -p {port} 127.0.0.1", uid),
+            env=env, capture_output=True, text=True, timeout=120).stdout
+        assert f"{port}/tcp open" in out, out
+
+        # Now put it out of scope; the same port must stop being reported open.
+        l3lane.apply_policy(
+            NetworkPolicy.from_lists(allow=["10.0.0.0/8"], default_egress="deny"), uid)
+        out = subprocess.run(
+            l3lane.wrap_shell(f"nmap -Pn -sT -p {port} 127.0.0.1", uid),
+            env=env, capture_output=True, text=True, timeout=120).stdout
+        assert f"{port}/tcp open" not in out, out
+    finally:
+        l3lane.clear_policy()
+        srv.close()
+
+
+def test_raw_socket_tools_are_detected_in_every_command_position():
+    assert sb._raw_socket_tool("nmap -sT 1.2.3.4") == "nmap"
+    assert sb._raw_socket_tool("/usr/bin/nmap -sS x") == "nmap"
+    assert sb._raw_socket_tool("sudo nmap 1.2.3.4") == "nmap"      # through a wrapper
+    assert sb._raw_socket_tool("echo hi | nmap -p80 1.2.3.4") == "nmap"  # after a pipe
+    assert sb._raw_socket_tool("curl http://x") is None
+    assert sb._raw_socket_tool("nmapx --foo") is None               # not a prefix match
+    # An argument that merely mentions a tool is not an invocation of it.
+    assert sb._raw_socket_tool("curl http://host/nmap") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(l3lane.available(), reason="only applies to the proxy lane")
+@needs_sandbox
+async def test_proxy_lane_refuses_a_scanner_instead_of_returning_fiction():
+    """The failure mode this guard exists for.
+
+    Run under the proxy lane, nmap cannot reach anything but still exits 0 and
+    reports every port as 'filtered'. An agent writes that into a report as a
+    finding about the target. Refusing is the only honest answer.
+    """
+    result = await sb.get_lane().run_shell("nmap -sT 127.0.0.1", timeout=20)
+    assert result["success"] is False
+    assert result["error"] == "raw_socket_tool_unsupported"
+    assert result["tool"] == "nmap"
+    assert "filtered" in result["stderr"]   # says *why*, not just "no"
+    await sb.get_lane().stop()
+
+
+@needs_l3
+@pytest.mark.asyncio
+async def test_packet_filter_lane_runs_scanners_normally():
+    """The counterpart: where scope can be enforced on packets, nmap just runs."""
+    result = await sb.get_lane().run_shell("nmap --version", timeout=30)
+    assert result.get("error") != "raw_socket_tool_unsupported"
+    assert "Nmap version" in result["stdout"], result
+    await sb.get_lane().stop()

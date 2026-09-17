@@ -377,6 +377,11 @@ async def execute_code(
         f.write(code)
         temp_path = f.name
 
+    # The command may run as a different account than the bridge (the
+    # packet-filter lane), in which case it cannot read what we just wrote.
+    from strobes_shell_agent import sandbox as _sandbox
+    _sandbox.adopt_path(temp_path)
+
     try:
         # Quote the interpreter + script path for the target shell. shlex.quote is
         # POSIX-only: on Windows it emits SINGLE quotes, which cmd.exe cannot parse

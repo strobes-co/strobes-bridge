@@ -421,23 +421,27 @@ def sandbox_check():
     """
     import asyncio
     import json as _json
-    from strobes_shell_agent import procsandbox, sandbox
+    from strobes_shell_agent import l3lane, procsandbox, sandbox
 
     info = procsandbox.describe()
+    l3 = l3lane.available()
     click.echo(f"platform: {info['platform']}")
-    click.echo(f"backend:  {info['backend'] or 'NONE'}")
+    click.echo(f"mode:     {'l3 (packet filter)' if l3 else 'proxy'}")
+    click.echo(f"backend:  {info['backend'] or ('nftables' if l3 else 'NONE')}")
     if info.get("windows"):
         click.echo("windows:  " + _json.dumps(info["windows"]))
     if info.get("hint"):
         click.echo(f"hint:     {info['hint']}")
 
-    if not info["available"]:
+    # Packet-level enforcement needs no process sandbox, so either is enough.
+    if not (info["available"] or l3):
         click.echo("\nEgress is NOT enforced on this host — commands will be refused.",
                    err=True)
         sys.exit(1)
 
     report = asyncio.run(sandbox.selftest())
-    click.echo(f"\nselftest: {'PASS' if report['ok'] else 'FAIL'} — {report['detail']}")
+    click.echo(f"\nselftest: {'PASS' if report['ok'] else 'FAIL'} "
+               f"[{report.get('mode')}] — {report['detail']}")
     sys.exit(0 if report["ok"] else 1)
 
 

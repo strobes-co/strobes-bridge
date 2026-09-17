@@ -32,7 +32,7 @@ import tempfile
 import time
 from typing import Optional
 
-from strobes_shell_agent import config, pack, procsandbox
+from strobes_shell_agent import config, l3lane, pack, procsandbox
 from strobes_shell_agent.egress_proxy import DEFAULT_PORT_RANGE, EgressProxy
 from strobes_shell_agent.netpolicy import NetworkPolicy
 from strobes_shell_agent.procsandbox import ProcSandbox, SandboxUnavailable
@@ -55,6 +55,38 @@ def _result(success: bool, stdout: str = "", stderr: str = "", exit_code: int = 
     return out
 
 
+#: Tools that work by opening raw sockets, and so cannot function through a
+#: proxy at all. This is a compatibility fact, not a policy: under the proxy
+#: lane the sandbox blocks their probes and they report every port as
+#: ``filtered`` — plausible, professional-looking, and wrong. Refusing is the
+#: only honest answer, because a false negative in a scan is worse than an
+#: error. They work normally in the packet-filter lane.
+RAW_SOCKET_TOOLS = frozenset({
+    "nmap", "masscan", "naabu", "zmap", "unicornscan", "hping3", "arp-scan",
+    "traceroute", "ping", "fping",
+})
+
+
+def _raw_socket_tool(command: str) -> Optional[str]:
+    """The first raw-socket tool invoked by ``command``, if any.
+
+    Looks at every position a command can start — after a pipe, a semicolon, a
+    boolean operator — because ``echo x | nmap ...`` is still an nmap run.
+    """
+    import re
+    for segment in re.split(r"[|;&]+|\$\(|`", command):
+        for token in segment.split():
+            if token.startswith("-"):
+                continue
+            name = os.path.basename(token).lower()
+            if name in ("sudo", "env", "time", "nohup", "stdbuf"):
+                continue  # a wrapper; keep looking at the real command
+            if name in RAW_SOCKET_TOOLS:
+                return name
+            break  # first real word of the segment decides
+    return None
+
+
 class Lane:
     """Owns the proxy and the sandbox, and runs commands through both."""
 
@@ -63,15 +95,42 @@ class Lane:
         self._proxy: Optional[EgressProxy] = None
         self._sandbox: Optional[ProcSandbox] = None
         self._socket_path: Optional[str] = None
+        self._l3_uid: Optional[int] = None
         self._lock = asyncio.Lock()
 
     # -- lifecycle ----------------------------------------------------------
 
-    async def ensure(self) -> ProcSandbox:
-        """Start the proxy and sandbox on first use; reuse them thereafter."""
+    @property
+    def mode(self) -> str:
+        """``l3`` (packet filter) or ``proxy`` — which enforcement is in force."""
+        return "l3" if self._l3_uid is not None else "proxy"
+
+    async def ensure(self):
+        """Bring up enforcement on first use; reuse it thereafter.
+
+        Packet-level enforcement is preferred wherever the host allows it,
+        because it is the only mode in which scanners produce correct results —
+        a proxy cannot carry a raw SYN, so under the proxy lane nmap reports
+        every port as filtered whether or not the target is in scope. The proxy
+        lane remains the fallback for hosts without CAP_NET_ADMIN, where it is
+        weaker but needs no privileges.
+        """
         async with self._lock:
-            if self._sandbox is not None:
+            if self._sandbox is not None or self._l3_uid is not None:
                 return self._sandbox
+
+            if l3lane.available():
+                uid = await asyncio.to_thread(l3lane.ensure_account)
+                caps = await asyncio.to_thread(l3lane.grant_raw_capabilities,
+                                               pack.build_env().get("PATH"))
+                await asyncio.to_thread(l3lane.apply_policy, self.policy, uid)
+                self._l3_uid = uid
+                logger.info(
+                    "Execution lane ready (mode=l3, uid=%s, raw-capable=%s, egress=%s)",
+                    uid, ",".join(caps.get("granted") or []) or "none",
+                    "open" if self.policy.is_open else "scoped allowlist",
+                )
+                return None
 
             backend = procsandbox.detect_backend()
             if backend is None:
@@ -107,6 +166,9 @@ class Lane:
             return self._sandbox
 
     async def stop(self) -> None:
+        if self._l3_uid is not None:
+            await asyncio.to_thread(l3lane.clear_policy)
+            self._l3_uid = None
         if self._proxy is not None:
             await self._proxy.stop()
             self._proxy = None
@@ -127,6 +189,10 @@ class Lane:
         mid-session takes effect on the very next connection.
         """
         self.policy = policy
+        if self._l3_uid is not None:
+            # Replaces the table atomically, so there is no window in which the
+            # old scope, or no scope, is in force.
+            l3lane.apply_policy(policy, self._l3_uid)
         if self._proxy is not None:
             self._proxy.set_policy(policy)
 
@@ -140,15 +206,48 @@ class Lane:
                         cwd: Optional[str] = None) -> dict:
         start = time.monotonic()
         try:
-            sandbox = await self.ensure()
+            sandbox = await self.ensure()   # None in l3 mode — no process wrapper
         except SandboxUnavailable as e:
             return _result(False, stderr=str(e), exit_code=-1, start=start,
                            error="sandbox_unavailable")
 
         if cwd and not os.path.isdir(cwd):
             cwd = None
+
+        # Under the proxy lane a scanner cannot reach anything, but it does not
+        # fail — it reports every port as filtered. Refuse rather than hand back
+        # results that look real.
+        if self._l3_uid is None:
+            tool = _raw_socket_tool(command)
+            if tool:
+                return _result(
+                    False,
+                    stderr=(
+                        f"{tool} needs raw sockets, which this host cannot "
+                        f"enforce scope on, so it is refused rather than run: "
+                        f"it would report every port as filtered whether or not "
+                        f"the target is in scope. Packet-level enforcement "
+                        f"(Linux with CAP_NET_ADMIN) runs it normally."
+                    ),
+                    exit_code=-1, start=start, error="raw_socket_tool_unsupported",
+                    tool=tool,
+                )
+
         if self._proxy is not None:
             self._proxy.denials.clear()
+
+        if self._l3_uid is not None:
+            argv = l3lane.wrap_shell(command, self._l3_uid)
+            env = l3lane.environment(pack.build_env())
+            try:
+                rc, stdout, stderr = await _spawn(argv, env, cwd, timeout)
+            except asyncio.TimeoutError:
+                return self._finish(False, "", f"Command timed out after {timeout}s",
+                                    -1, start, error="timeout")
+            except Exception as e:
+                return _result(False, stderr=f"failed to start command: {e}",
+                               exit_code=-1, start=start, error="sandbox_start_failed")
+            return self._finish(rc == 0, stdout, stderr, rc, start)
 
         env = sandbox.env(pack.build_env())
         try:
@@ -178,6 +277,22 @@ class Lane:
             )
             stderr = (stderr + f"\n[strobes] egress denied: {note}").strip()
         return _result(success, stdout, stderr, exit_code, start, error=error, **extra)
+
+
+async def _spawn(argv: list, env: dict, cwd, timeout: int) -> tuple:
+    """Run ``argv`` to completion, killing the whole tree on timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=cwd, env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        procsandbox._kill_tree(proc)
+        raise
+    return (proc.returncode or 0,
+            out.decode(errors="replace"), err.decode(errors="replace"))
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +392,9 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
     is meant to bound.
     """
     lane = get_lane()
+    if lane._l3_uid is not None:
+        return (l3lane.wrap_shell(command, lane._l3_uid),
+                l3lane.environment(base_env or pack.build_env()))
     box = lane._sandbox
     if box is None:
         raise SandboxUnavailable(
@@ -293,6 +411,37 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
     return box.wrap_shell(command), box.env(base_env or pack.build_env())
 
 
+def adopt_path(path: str) -> None:
+    """Make ``path`` usable by the identity commands run as.
+
+    In the packet-filter lane commands run as a separate account, so anything
+    the *bridge* writes for a command to read — an interpreter source file, an
+    input fixture — is owned by the wrong user. Ownership is handed over
+    explicitly rather than by loosening the mode, so the file never becomes
+    world-readable just to cross that boundary.
+
+    A no-op in the proxy lane, where the command runs as the bridge's own user.
+    """
+    # Resolved without needing the lane to be running: the file is written
+    # before the first command starts it.
+    if _lane is not None and _lane._l3_uid is not None:
+        uid = _lane._l3_uid
+    elif l3lane.available():
+        # The account is created here if the lane has not started yet — knowing
+        # the identity to hand the file to is the same thing as having one.
+        uid = l3lane.account_uid() or l3lane.ensure_account()
+    else:
+        return
+    if uid is None:
+        return
+    try:
+        os.chown(path, uid, -1)
+    except OSError:
+        # Not fatal: the command will report its own permission error, which is
+        # a clearer signal than a failure here would be.
+        pass
+
+
 def describe_policy() -> dict:
     """What is enforced right now — for the CLI banner and the platform."""
     p = _current_policy()
@@ -302,7 +451,10 @@ def describe_policy() -> dict:
         "deny": [e.value for e in p.deny],
         "block_metadata": p.block_metadata,
         "enforced": not p.is_open,
+        "mode": _lane.mode if _lane is not None else (
+            "l3" if l3lane.available() else "proxy"),
         "sandbox": procsandbox.describe(),
+        "l3": l3lane.status(),
     }
 
 
@@ -365,13 +517,14 @@ async def selftest() -> dict:
 
         return {
             "ok": ok,
+            "mode": lane.mode,
             "backend": procsandbox.detect_backend(),
             "detail": detail,
             "allowed_reachable": reachable,
             "denied": denials,
         }
     except SandboxUnavailable as e:
-        return {"ok": False, "backend": None, "detail": str(e)}
+        return {"ok": False, "mode": None, "backend": None, "detail": str(e)}
     finally:
         await lane.stop()
         server.close()

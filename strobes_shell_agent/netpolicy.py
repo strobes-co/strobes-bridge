@@ -229,19 +229,34 @@ class ResolvedPolicy:
         return tuple(out)
 
     # -- scan lane (Linux netns + nftables) --------------------------------
-    def to_nftables(self, table: str = "strobes_jail") -> str:
-        """Render an ``nft`` ruleset for the scan lane's private namespace.
+    def to_nftables(self, uid: Optional[int] = None,
+                    table: str = "strobes_scope") -> str:
+        """Render an ``nft`` ruleset enforcing this policy at L3.
 
-        Applied *inside* a rootless network namespace, so these are namespaced
-        rules — they never appear in, or affect, the host's tables. Default-deny
-        on the ``output`` hook, with loopback + DNS carved out first, hard-deny
-        ranges dropped next, then the allow set accepted. nftables matches on the
-        originating socket, so this catches raw-socket SYN scans that a userspace
-        proxy would miss — the whole reason the scan lane exists.
+        This is the lane that lets scanners work. A userspace proxy can only
+        carry what a tool is willing to send through it, so a port scanner —
+        whose whole job is raw connections — either bypasses the proxy or, if
+        the sandbox blocks it, reports every port as filtered. Filtering packets
+        instead means the tool uses ordinary sockets and the kernel decides,
+        which is both correct for the tool and stricter: a raw SYN is matched
+        just like a ``connect``.
+
+        ``uid`` scopes the rules to the account commands run as, so the bridge's
+        own traffic (and everything else on the host) is untouched. Without it
+        the ruleset applies to the whole machine, which is only ever right
+        inside a private network namespace.
+
+        Ordering is the same contract as every other lane — deny wins:
+        established flows, then loopback and DNS, then hard denies, then the
+        allow set, then the default.
+
+        ``reject`` rather than ``drop``: a dropped packet is indistinguishable
+        from a black hole, so the caller waits out a TCP timeout and a scanner
+        reports ``filtered``. Rejecting fails immediately and tells the truth.
         """
         allow4, allow6 = _split_family(self.allow_cidrs)
         deny4, deny6 = _split_family(self.hard_denied_cidrs())
-        default = "accept" if self.source.default_egress == "allow" else "drop"
+        default = "accept" if self.source.default_egress == "allow" else "reject"
 
         lines = [f"table inet {table} {{"]
         if allow4:
@@ -251,20 +266,23 @@ class ResolvedPolicy:
             lines.append("  set allow6 { type ipv6_addr; flags interval;")
             lines.append(f"    elements = {{ {', '.join(sorted(allow6))} }} }}")
         lines.append("  chain output {")
-        lines.append("    type filter hook output priority 0; policy drop;")
+        lines.append("    type filter hook output priority 0; policy accept;")
+        if uid is not None:
+            # Everything that is not the sandboxed account leaves untouched —
+            # the bridge still needs to reach the platform to report results.
+            lines.append(f"    meta skuid != {uid} accept")
         lines.append("    ct state established,related accept")
-        lines.append("    oif \"lo\" accept")
-        for c in _LOOPBACK_CIDRS:
-            fam = "ip6" if ":" in c else "ip"
-            lines.append(f"    {fam} daddr {c} accept")
-        # DNS must survive so the workload can resolve names.
+        # Loopback is deliberately *not* carved out. It is the operator's own
+        # machine — every local service and debug port — so reaching it must be
+        # asked for by a rule, exactly as in the proxy lane. DNS below is the
+        # one exception, because a hostname scope is unusable without it.
         lines.append(f"    udp dport {_DNS_PORT} accept")
         lines.append(f"    tcp dport {_DNS_PORT} accept")
-        # Hard denies before allows — deny wins.
+        # Hard denies ahead of every allow — deny wins.
         for c in deny4:
-            lines.append(f"    ip daddr {c} drop")
+            lines.append(f"    ip daddr {c} reject")
         for c in deny6:
-            lines.append(f"    ip6 daddr {c} drop")
+            lines.append(f"    ip6 daddr {c} reject")
         if allow4:
             lines.append("    ip daddr @allow4 accept")
         if allow6:

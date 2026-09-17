@@ -71,27 +71,59 @@ def test_unresolved_host_is_recorded_not_fatal():
 
 # -- nftables rendering (scan lane) ----------------------------------------
 
-def test_nftables_default_deny_and_carveouts():
-    p = NetworkPolicy.from_lists(allow=["1.2.3.4"])
-    nft = p.resolve().to_nftables()
-    assert "policy drop;" in nft
-    assert 'oif "lo" accept' in nft
-    assert "udp dport 53 accept" in nft
+def test_nftables_scopes_rules_to_the_sandbox_uid():
+    """The bridge's own traffic must survive its own ruleset.
+
+    Without the uid guard the table would apply to the whole machine, including
+    the websocket the bridge reports results over.
+    """
+    nft = NetworkPolicy.from_lists(allow=["1.2.3.4"]).resolve().to_nftables(uid=1500)
+    assert "meta skuid != 1500 accept" in nft
     assert "ip daddr @allow4 accept" in nft
     assert "1.2.3.4/32" in nft
 
 
+def test_nftables_rejects_rather_than_drops():
+    """A dropped packet is indistinguishable from a black hole.
+
+    The caller waits out a full TCP timeout and a scanner reports the port as
+    filtered. Rejecting fails immediately and says so.
+    """
+    nft = NetworkPolicy.from_lists(allow=["1.2.3.4"]).resolve().to_nftables(uid=1500)
+    assert "reject" in nft
+    assert "drop" not in nft
+
+
+def test_nftables_does_not_carve_out_loopback():
+    """Loopback is the operator's own machine, so it must be asked for.
+
+    Same rule as the proxy lane: reaching a local service is a scope decision,
+    not a freebie.
+    """
+    nft = NetworkPolicy.from_lists(allow=["1.2.3.4"]).resolve().to_nftables(uid=1500)
+    assert "127.0.0.0/8 accept" not in nft
+    assert 'oif "lo" accept' not in nft
+    # DNS is the one exception, or a hostname scope cannot resolve.
+    assert "udp dport 53 accept" in nft
+
+
 def test_nftables_hard_denies_metadata_before_allow():
     p = NetworkPolicy.from_lists(allow=["0.0.0.0/0"])
-    nft = p.resolve().to_nftables()
-    drop_idx = nft.index("169.254.169.254/32 drop")
+    nft = p.resolve().to_nftables(uid=1500)
+    deny_idx = nft.index("169.254.169.254/32 reject")
     allow_idx = nft.index("@allow4 accept")
-    assert drop_idx < allow_idx  # deny wins — metadata dropped before the allow
+    assert deny_idx < allow_idx  # deny wins — metadata shut before the allow
+
+
+def test_nftables_open_policy_still_blocks_metadata():
+    nft = NetworkPolicy.from_lists(default_egress="allow").resolve().to_nftables(uid=1500)
+    assert "169.254.169.254/32 reject" in nft
+    assert nft.rstrip().endswith("accept\n  }\n}") or "    accept" in nft
 
 
 def test_nftables_ipv6_set_separate():
     p = NetworkPolicy.from_lists(allow=["2001:db8::1", "1.2.3.4"])
-    nft = p.resolve().to_nftables()
+    nft = p.resolve().to_nftables(uid=1500)
     assert "set allow6" in nft
     assert "set allow4" in nft
     assert "ip6 daddr @allow6 accept" in nft
