@@ -11,6 +11,7 @@ import click
 
 from strobes_shell_agent.config import CONFIG_DIR, get_or_create_bridge_id, get_env
 from strobes_shell_agent.client import ShellBridgeClient
+from strobes_shell_agent import sandbox
 from strobes_shell_agent import service as svc
 from strobes_shell_agent import __version__
 
@@ -26,6 +27,32 @@ if sys.platform == "win32":
             _stream.reconfigure(encoding="utf-8")
         except (AttributeError, ValueError):
             pass
+
+
+def _split_net_list(values) -> list:
+    """Flatten repeated and comma-separated egress entries into one list."""
+    out = []
+    for value in values or ():
+        out.extend(c for c in str(value).replace(",", " ").split() if c.strip())
+    return out
+
+
+def _describe_egress(policy: dict) -> str:
+    """One line describing the egress posture, for the startup banner."""
+    sb = policy["sandbox"]
+    if not sb["available"]:
+        return f"NOT ENFORCED — no sandbox backend on {sb['platform']}"
+    if not policy["enforced"]:
+        tail = "" if policy["block_metadata"] else ", metadata blocking OFF"
+        return f"open — all destinations allowed ({sb['backend']}{tail})"
+    bits = [f"default {policy['default_egress']}"]
+    if policy["allow"]:
+        bits.append(f"{len(policy['allow'])} allowed")
+    if policy["deny"]:
+        bits.append(f"{len(policy['deny'])} denied")
+    if not policy["block_metadata"]:
+        bits.append("metadata blocking OFF")
+    return ", ".join(bits) + f" ({sb['backend']})"
 
 
 def setup_logging(verbose: bool):
@@ -69,8 +96,23 @@ def main():
               help="PID file path when --daemon is set.")
 @click.option("--log-file", default=None, envvar="STROBES_LOG_FILE",
               help="Log file path when --daemon is set.")
+@click.option("--net-allow", multiple=True, envvar="STROBES_NET_ALLOW",
+              help="Egress allowlist entry — hostname, IP or CIDR. Repeatable or "
+                   "comma-separated. Adding any entry switches the bridge to "
+                   "default-deny. (env: STROBES_NET_ALLOW)")
+@click.option("--net-deny", multiple=True, envvar="STROBES_NET_DENY",
+              help="Egress denylist entry. Deny always wins over allow. "
+                   "(env: STROBES_NET_DENY)")
+@click.option("--net-default", type=click.Choice(["allow", "deny"]), default=None,
+              envvar="STROBES_NET_DEFAULT",
+              help="What happens to traffic no rule matched. Defaults to allow "
+                   "when no --net-allow is given, deny when one is.")
+@click.option("--net-block-metadata/--no-net-block-metadata", default=None,
+              help="Keep cloud-metadata and link-local shut regardless of the "
+                   "rules above. On by default.")
 def connect(url, api_key, org_id, bridge_id, name, cwd, ssl_verify, verbose,
-            daemon, pid_file, log_file):
+            daemon, pid_file, log_file, net_allow, net_deny, net_default,
+            net_block_metadata):
     """Connect to Strobes and start accepting commands.
 
     All options can be set via environment variables or a .env file.
@@ -116,6 +158,20 @@ def connect(url, api_key, org_id, bridge_id, name, cwd, ssl_verify, verbose,
         svc.daemonize(pid_path, log_path)
         setup_logging(verbose)  # Re-init logging now that stdio is redirected.
 
+    # Egress scope, set once by the operator. The platform can replace it at
+    # runtime via ``sandbox_configure``; both write the same policy.
+    allow = _split_net_list(net_allow)
+    deny = _split_net_list(net_deny)
+    # Naming targets without saying what to do with everything else almost
+    # always means "only these" — staying open would ignore the scope just typed.
+    sandbox.set_initial_policy(
+        allow=allow or None,
+        deny=deny or None,
+        default_egress=net_default or ("deny" if allow else None),
+        block_metadata=net_block_metadata,
+    )
+    policy = sandbox.describe_policy()
+
     client = ShellBridgeClient(
         url=url,
         api_key=api_key,
@@ -132,7 +188,12 @@ def connect(url, api_key, org_id, bridge_id, name, cwd, ssl_verify, verbose,
     click.echo(f"  Org:        {org_id}")
     click.echo(f"  Server:     {url}")
     click.echo(f"  CWD:        {client.cwd}")
+    click.echo(f"  Egress:     {_describe_egress(policy)}")
     click.echo()
+    if not policy["sandbox"]["available"]:
+        click.echo("WARNING: no process sandbox on this platform — commands "
+                   "will be refused rather than run unconfined.", err=True)
+        click.echo()
 
     # Handle graceful shutdown
     loop = asyncio.new_event_loop()
@@ -343,3 +404,80 @@ def stop():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Sandbox provisioning and verification
+# ---------------------------------------------------------------------------
+
+@main.command("sandbox-check")
+def sandbox_check():
+    """Verify that egress is actually confined on this host.
+
+    Runs a real command that tries to reach a deliberately out-of-scope address
+    and reports whether it was refused. This is the check that matters on a
+    platform the bridge has not been proven on — it exercises the live backend
+    rather than trusting that the code is right.
+    """
+    import asyncio
+    import json as _json
+    from strobes_shell_agent import procsandbox, sandbox
+
+    info = procsandbox.describe()
+    click.echo(f"platform: {info['platform']}")
+    click.echo(f"backend:  {info['backend'] or 'NONE'}")
+    if info.get("windows"):
+        click.echo("windows:  " + _json.dumps(info["windows"]))
+    if info.get("hint"):
+        click.echo(f"hint:     {info['hint']}")
+
+    if not info["available"]:
+        click.echo("\nEgress is NOT enforced on this host — commands will be refused.",
+                   err=True)
+        sys.exit(1)
+
+    report = asyncio.run(sandbox.selftest())
+    click.echo(f"\nselftest: {'PASS' if report['ok'] else 'FAIL'} — {report['detail']}")
+    sys.exit(0 if report["ok"] else 1)
+
+
+@main.command("sandbox-setup")
+def sandbox_setup():
+    """Provision the Windows sandbox account and its egress filter (elevated).
+
+    Only Windows needs this: macOS and Linux confine a process directly, but
+    Windows has no equivalent primitive, so the boundary is drawn around a
+    dedicated local account whose outbound traffic a firewall rule blocks.
+    Creating that account and installing the rule both require Administrator.
+    """
+    from strobes_shell_agent import winsandbox
+    from strobes_shell_agent.egress_proxy import DEFAULT_PORT_RANGE
+
+    if not winsandbox.IS_WINDOWS:
+        click.echo("Only Windows needs setup; this host confines processes directly.")
+        sys.exit(0)
+    try:
+        result = winsandbox.setup(DEFAULT_PORT_RANGE)
+    except winsandbox.WindowsSetupError as e:
+        click.echo(f"Setup failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Created account {result['account']} ({result['sid']})")
+    click.echo(f"Installed firewall rule: {', '.join(result['rules'])}")
+    click.echo(f"Proxy port range: {result['port_range'][0]}-{result['port_range'][1]}")
+    click.echo("\nNow run `strobes-shell-agent sandbox-check` to confirm it works.")
+
+
+@main.command("sandbox-teardown")
+def sandbox_teardown():
+    """Remove the Windows sandbox account and its egress filter (elevated)."""
+    from strobes_shell_agent import winsandbox
+
+    if not winsandbox.IS_WINDOWS:
+        click.echo("Nothing to remove on this platform.")
+        sys.exit(0)
+    try:
+        winsandbox.teardown()
+    except winsandbox.WindowsSetupError as e:
+        click.echo(f"Teardown failed: {e}", err=True)
+        sys.exit(1)
+    click.echo("Removed the sandbox account and its firewall rule.")

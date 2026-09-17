@@ -13,6 +13,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from strobes_shell_agent import pack
+from strobes_shell_agent import sandbox
 from strobes_shell_agent import selfupdate
 from strobes_shell_agent import sessions
 from strobes_shell_agent import responder
@@ -365,6 +366,23 @@ class ShellBridgeClient:
         # --- Background jobs (detached; platform polls) ---
         # Run in a worker thread: bg_cancel can block on taskkill, and none of
         # these should stall the daemon's event loop.
+        elif command == "sandbox_configure":
+            # Platform-pushed egress scope. Takes effect on the next connection
+            # any command makes — the proxy reads the policy per connection.
+            return await sandbox.configure(
+                allow=params.get("allow"),
+                deny=params.get("deny"),
+                default_egress=params.get("default_egress"),
+                block_metadata=params.get("block_metadata"),
+            )
+
+        elif command == "sandbox_status":
+            return {"success": True, **sandbox.describe_policy()}
+
+        elif command == "sandbox_selftest":
+            # Proves egress is actually confined on this host.
+            return {"success": True, **(await sandbox.selftest())}
+
         elif command == "shell_bg_start":
             return await asyncio.to_thread(
                 bg_start,

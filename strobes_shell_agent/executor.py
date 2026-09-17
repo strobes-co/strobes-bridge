@@ -38,8 +38,23 @@ async def execute_shell_command(
     timeout: int = 60,
     cwd: Optional[str] = None,
 ) -> dict:
-    """Execute a shell command via subprocess. Spawns in its own process group
-    so a timeout kills any child processes the command may have started."""
+    """Execute a shell command inside the egress-scoped sandbox.
+
+    The sandbox is the only execution path: see :mod:`sandbox`. Host execution
+    is kept below as ``_execute_shell_command_host`` for tests and tooling that
+    explicitly want it, but the bridge never reaches for it — running a command
+    unsandboxed would mean reporting a scope that is not being applied.
+    """
+    from strobes_shell_agent import sandbox
+    return await sandbox.get_lane().run_shell(command, timeout=timeout, cwd=cwd)
+
+
+async def _execute_shell_command_host(
+    command: str,
+    timeout: int = 60,
+    cwd: Optional[str] = None,
+) -> dict:
+    """Legacy host-subprocess execution — no egress enforcement. Tests only."""
     start = time.monotonic()
     if cwd and not os.path.isdir(cwd):
         cwd = None
