@@ -220,13 +220,22 @@ def bg_start(
     out_f = open(workdir / "stdout", "wb")
     err_f = open(workdir / "stderr", "wb")
 
+    # Background jobs carry the long-running scan traffic, so they are confined
+    # exactly like foreground ones: the sandbox wrapper becomes the argv, and
+    # the proxy environment rides along to every child it spawns.
+    from strobes_shell_agent import sandbox as _sandbox
+    try:
+        argv, env = _sandbox.confine(command)
+    except _sandbox.SandboxUnavailable as e:
+        out_f.close(); err_f.close()
+        return {"success": False, "error": str(e)}
+
     popen_kwargs = {
         "stdout": out_f,
         "stderr": err_f,
         "stdin": subprocess.DEVNULL,
         "cwd": cwd,
-        "env": pack.build_env(),
-        "shell": True,
+        "env": env,
     }
     if IS_WINDOWS:
         popen_kwargs["creationflags"] = _WIN_DETACHED_FLAGS
@@ -236,7 +245,7 @@ def bg_start(
         popen_kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(command, **popen_kwargs)
+        proc = subprocess.Popen(argv, **popen_kwargs)
     except Exception as e:
         out_f.close()
         err_f.close()

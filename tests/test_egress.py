@@ -500,3 +500,92 @@ async def test_selftest_fails_when_out_of_scope_is_reachable(monkeypatch):
     report = await sb.selftest()
     assert report["ok"] is False
     assert "not enforced" in report["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Every execution path, not just the obvious one
+#
+# The bridge can launch work four ways, and only shell_execute goes through the
+# lane's own spawn — background jobs and sessions own their process. Each was
+# unconfined until they were wired through sandbox.confine(); these tests exist
+# so the next path that gets added cannot quietly skip it.
+# ---------------------------------------------------------------------------
+
+@needs_sandbox
+@pytest.mark.asyncio
+async def test_background_jobs_are_confined(origin):
+    """Background jobs carry the long-running scan traffic — the most important
+    path to confine, and the one that was silently escaping."""
+    c = client()
+    await c._dispatch_command("sandbox_configure",
+                              {"allow": ["127.0.0.1"], "default_egress": "deny"})
+
+    async def run_bg(task_id, command):
+        started = await c._dispatch_command(
+            "shell_bg_start", {"task_id": task_id, "command": command})
+        assert started.get("success"), started
+        for _ in range(60):
+            await asyncio.sleep(0.25)
+            poll = await c._dispatch_command("shell_bg_poll", {"task_id": task_id})
+            if not poll.get("running"):
+                return (poll.get("stdout") or "").strip()
+        pytest.fail("background job did not finish")
+
+    assert (await run_bg("t-in", f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+                                 f"http://127.0.0.1:{origin}/")) == "200"
+    assert (await run_bg("t-out", f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+                                  f"http://{BLACKHOLE}/")) != "200"
+    # A proxy-blind tool must get nothing, not unfiltered access.
+    assert "BLOCKED" in (await run_bg(
+        "t-nc", f"nc -z -w3 {BLACKHOLE} 443 && echo REACHED || echo BLOCKED"))
+    await sb.get_lane().stop()
+
+
+@needs_sandbox
+@pytest.mark.asyncio
+async def test_sessions_are_confined(origin):
+    """A session confines the shell itself, so everything typed into it — for as
+    long as the foothold lives — inherits the scope."""
+    c = client()
+    await c._dispatch_command("sandbox_configure",
+                              {"allow": ["127.0.0.1"], "default_egress": "deny"})
+    sid = (await c._dispatch_command("session_create", {"label": "t"}))["session_id"]
+    try:
+        async def run(cmd):
+            r = await c._dispatch_command(
+                "session_exec", {"session_id": sid, "command": cmd})
+            return (r.get("output") or "").strip()
+
+        assert (await run("echo $ALL_PROXY")).startswith("socks5h://")
+        assert (await run(f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+                          f"http://127.0.0.1:{origin}/")) == "200"
+        assert (await run(f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+                          f"http://{BLACKHOLE}/")) != "200"
+        assert "BLOCKED" in (await run(
+            f"nc -z -w3 {BLACKHOLE} 443 && echo REACHED || echo BLOCKED"))
+    finally:
+        await c._dispatch_command("session_delete", {"session_id": sid})
+        await sb.get_lane().stop()
+
+
+def test_every_spawning_command_waits_for_the_lane():
+    """Detached launches run off the event loop, so the lane must be up first.
+
+    A command that spawns its own process but is missing from this set would be
+    dispatched before the proxy is listening, and `confine` would refuse it.
+    """
+    from strobes_shell_agent.client import ShellBridgeClient as C
+    assert {"shell_bg_start", "session_create", "session_exec"} <= C._NEEDS_LANE
+
+
+@pytest.mark.asyncio
+async def test_confine_refuses_rather_than_returning_a_bare_command(monkeypatch):
+    """The failure that must never happen: handing back an unconfined argv.
+
+    A background scan that escaped the scope would be the worst case, since it
+    is precisely the traffic a scope exists to bound.
+    """
+    monkeypatch.setattr(procsandbox, "detect_backend", lambda: None)
+    sb._lane = None
+    with pytest.raises(sb.SandboxUnavailable):
+        sb.confine("curl http://example.com")

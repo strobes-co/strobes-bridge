@@ -346,8 +346,21 @@ class ShellBridgeClient:
         except Exception as e:
             logger.error(f"Failed to send response for {request_id}: {e}", exc_info=True)
 
+    #: Commands that launch their own process off the event loop, so the
+    #: execution lane must already be listening before they are dispatched.
+    _NEEDS_LANE = frozenset({
+        "shell_bg_start", "session_create", "session_exec",
+    })
+
     async def _dispatch_command(self, command: str, params: dict) -> dict:
         """Dispatch a command to the appropriate executor."""
+        if command in self._NEEDS_LANE:
+            try:
+                await sandbox.ensure_ready()
+            except Exception as e:
+                # Refuse rather than fall through to an unconfined launch.
+                return {"success": False, "error": f"sandbox unavailable: {e}"}
+
         if command == "shell_execute":
             return await execute_shell_command(
                 command=params.get("command", ""),

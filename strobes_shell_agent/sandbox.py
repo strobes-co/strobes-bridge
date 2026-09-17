@@ -254,6 +254,45 @@ async def configure(allow=None, deny=None, default_egress: Optional[str] = None,
     return status
 
 
+async def ensure_ready() -> None:
+    """Start the lane so :func:`confine` can be used from a worker thread.
+
+    Detached and interactive launches (background jobs, shell sessions, PTYs)
+    happen synchronously off the event loop, so the proxy has to be listening
+    before they are handed the confinement wrapper.
+    """
+    await get_lane().ensure()
+
+
+def confine(command: str, base_env: Optional[dict] = None) -> tuple:
+    """Return ``(argv, env)`` that runs ``command`` under the egress sandbox.
+
+    The synchronous counterpart to :meth:`Lane.run_shell`, for the launch sites
+    that own their own process (``subprocess.Popen`` for a background job, a
+    PTY-attached shell) and so cannot go through the lane's own spawn.
+
+    Raises :class:`SandboxUnavailable` rather than returning an unconfined
+    command — a background scan that quietly escapes the scope would be the
+    worst of both worlds, since it is exactly the long-running traffic a scope
+    is meant to bound.
+    """
+    lane = get_lane()
+    box = lane._sandbox
+    if box is None:
+        raise SandboxUnavailable(
+            "the execution lane is not running; call ensure_ready() first"
+        )
+    if box.backend == procsandbox.WINDOWS:
+        # Windows confines by launching under another account's token, which has
+        # no argv form. Detached launches there are refused until that path
+        # grows a detached variant.
+        raise SandboxUnavailable(
+            "background jobs and sessions are not yet supported under the "
+            "Windows sandbox; use shell_execute, which is confined"
+        )
+    return box.wrap_shell(command), box.env(base_env or pack.build_env())
+
+
 def describe_policy() -> dict:
     """What is enforced right now — for the CLI banner and the platform."""
     p = _current_policy()

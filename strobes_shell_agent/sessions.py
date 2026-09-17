@@ -19,6 +19,7 @@ POSIX (Linux/macOS) via a PTY-backed shell. Windows sessions are a follow-up.
 import os
 import re
 import select
+import shlex
 import subprocess
 import threading
 import time
@@ -66,6 +67,11 @@ class _Session:
         self.shell = argv[0]
         env = {**os.environ, "PS1": "", "PS2": "", "PROMPT": "", "TERM": "dumb",
                "PAGER": "cat", "GIT_PAGER": "cat"}
+        # Confine the session's shell, not each command typed into it: the
+        # sandbox and the proxy environment are inherited by everything the
+        # session goes on to run, for as long as it lives.
+        from strobes_shell_agent import sandbox as _sandbox
+        argv, env = _sandbox.confine(" ".join(shlex.quote(a) for a in argv), env)
         self.proc = subprocess.Popen(
             argv, stdin=slave, stdout=slave, stderr=slave,
             cwd=self.cwd, start_new_session=True, env=env, close_fds=True)
