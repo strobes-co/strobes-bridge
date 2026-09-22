@@ -164,6 +164,25 @@ def _extra_env() -> dict:
     out = {}
     for var, rel in (_manifest(pack).get("env") or {}).items():
         out[var] = str((pack / rel).resolve())
+
+    # Never let the HOST's user site-packages shadow the pack's own SDKs.
+    #
+    # The packed interpreter is a standard CPython, so it still reads
+    # ~/.local/lib/python3.X/site-packages when the minor version matches.
+    # A host that has ever `pip install --user`-ed strobes_pt therefore wins
+    # over the packed copy, silently and only for whichever modules the stale
+    # copy happens to have -- caught exactly that way in testing: every SDK
+    # imported fine while `strobes_pt.flows` raised ModuleNotFoundError,
+    # because a months-old user-site copy predated that module. The failure
+    # looks like a missing feature, not a shadowed install, which is what
+    # makes it expensive to debug on someone else's machine.
+    out["PYTHONNOUSERSITE"] = "1"
+
+    # Where the baked system skills live, for the skill loader to point
+    # ~/.strobes/skills at instead of shipping bytes per load.
+    skills = pack / "skills"
+    if skills.is_dir():
+        out["STROBES_PACK_SKILLS_DIR"] = str(skills.resolve())
     return out
 
 
