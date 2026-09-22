@@ -36,6 +36,21 @@ def setup_logging(verbose: bool):
         datefmt="%H:%M:%S",
     )
 
+    # Keep `websockets` off DEBUG even under -v.
+    #
+    # The API KEY travels in the WebSocket URL query string
+    # (client.py's ws_url: ...?api_key=...), and the websockets library logs
+    # the request line at DEBUG -- `logger.debug("> GET %s HTTP/1.1", ...)`.
+    # Since -v sets DEBUG on the ROOT logger and websockets propagates to
+    # it, turning on verbose logging wrote the live api_key in cleartext to
+    # the console and, with --daemon --log-file, to a file on the customer's
+    # disk, on every reconnect.
+    #
+    # Pinned to INFO regardless of -v: the frame-level chatter it emits at
+    # DEBUG has never been the useful part of a verbose run, and no amount
+    # of it is worth leaking the credential.
+    logging.getLogger("websockets").setLevel(logging.INFO)
+
 
 @click.group()
 @click.version_option(version=__version__)

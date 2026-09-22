@@ -615,8 +615,19 @@ def install_skills(uv: str, pybin: Path, pack: Path, skills_src: Path) -> dict:
     for pkg, slug in sorted(SDK_PACKAGES.items()):
         scripts = dest / slug / "scripts"
         if not (scripts / pkg).is_dir():
-            print(f"      WARNING: {slug}/scripts/{pkg} absent -- skipping {pkg}")
-            continue
+            # Fail the build rather than ship a pack that LOOKS like it has
+            # the SDKs. pack.py turns on PYTHONNOUSERSITE as soon as
+            # pack/skills exists, which hides the host's user site-packages
+            # -- so a pack missing one SDK would make that SDK unimportable
+            # rather than falling back, reproducing the exact
+            # ModuleNotFoundError this baking was meant to end. A skills
+            # checkout without one of the four toolkits is a broken
+            # checkout, not a valid pack.
+            raise SystemExit(
+                f"{slug}/scripts/{pkg} is absent from the skills checkout -- "
+                "refusing to build a pack that would ship PYTHONNOUSERSITE "
+                f"without {pkg}"
+            )
         pyproject = scripts / "pyproject.toml"
         pyproject.write_text(
             "[build-system]\n"
