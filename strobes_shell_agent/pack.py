@@ -170,6 +170,7 @@ def _extra_env() -> dict:
     skills = pack / "skills"
     if skills.is_dir():
         out["STROBES_PACK_SKILLS_DIR"] = str(skills.resolve())
+        link_baked_skills(skills)
 
         # Only NOW is it safe to hide the host's user site-packages.
         #
@@ -192,6 +193,55 @@ def _extra_env() -> dict:
         # stop being shadowed.
         out["PYTHONNOUSERSITE"] = "1"
     return out
+
+
+def link_baked_skills(skills_dir: Path) -> int:
+    """Point ``~/.strobes/skills/<slug>`` at each baked skill in the pack.
+
+    Exposing STROBES_PACK_SKILLS_DIR alone was not enough: every SKILL.md,
+    every skill's own self-heal text and ~12 backend call sites all name
+    ``~/.strobes/skills/<slug>/``, so that is the path the agent actually
+    looks in. Without these links the pack ships the catalog and the agent
+    never sees it -- the same mistake the MicroVM image made by baking to
+    /root while HOME was the per-context dir.
+
+    Linked PER SLUG rather than symlinking the whole directory, because
+    ``~/.strobes/skills`` is also where ORG skills are written at runtime. A
+    directory symlink would send those writes inside the pack, which is
+    shared and may be read-only.
+
+    A real directory already at a slug wins: it may hold an org skill, or a
+    system skill whose bytes were shipped before the pack had it. Never
+    raises -- a failure here means "no baked skills", i.e. the pre-pack
+    behaviour where load_skill ships the bytes.
+    """
+    dest = Path.home() / ".strobes" / "skills"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(f"cannot create {dest}: {e}")
+        return 0
+
+    linked = 0
+    for baked in sorted(skills_dir.iterdir()):
+        if not baked.is_dir():
+            continue
+        link = dest / baked.name
+        try:
+            if link.is_symlink():
+                if os.readlink(str(link)) == str(baked):
+                    linked += 1
+                    continue
+                link.unlink()
+            elif link.exists():
+                continue
+            link.symlink_to(baked, target_is_directory=True)
+            linked += 1
+        except OSError:
+            continue
+    if linked:
+        log.info(f"Linked {linked} baked skills into {dest}")
+    return linked
 
 
 @lru_cache(maxsize=1)

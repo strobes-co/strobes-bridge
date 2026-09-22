@@ -597,11 +597,17 @@ def install_skills(uv: str, pybin: Path, pack: Path, skills_src: Path) -> dict:
         "__pycache__", "*.pyc", "._*",
     ))
 
-    # SKILL.md is served from S3, never read inside a sandbox -- strip every copy.
-    stripped = 0
-    for md in dest.rglob("SKILL.md"):
-        md.unlink()
-        stripped += 1
+    # SKILL.md is KEPT, deliberately.
+    #
+    # It used to be stripped here (and the MicroVM image did the same) on the
+    # reasoning that it is agent-facing prompt text always served fresh from
+    # S3, so a wording fix should not need a release. That held while nothing
+    # was baked. Now that both surfaces bake the catalog, load_skill reads the
+    # instructions off the mount instead of shipping them over the wire -- and
+    # it cannot do that if the one file holding the instructions is the one
+    # file missing. The trade is explicit: a wording change now rides a pack
+    # release, in exchange for no per-load fetch and no S3 at runtime.
+    kept = len(list(dest.rglob("SKILL.md")))
 
     # pip-install each SDK into the pack's own interpreter. None of them ship
     # packaging metadata, so generate a pyproject transiently and remove it --
@@ -643,7 +649,7 @@ def install_skills(uv: str, pybin: Path, pack: Path, skills_src: Path) -> dict:
                 h.update(f.read_bytes())
         lock[slug_dir.name] = h.hexdigest()
 
-    print(f"      {len(lock)} skills baked, {stripped} SKILL.md stripped")
+    print(f"      {len(lock)} skills baked, {kept} SKILL.md kept")
     return lock
 
 
