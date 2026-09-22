@@ -165,24 +165,32 @@ def _extra_env() -> dict:
     for var, rel in (_manifest(pack).get("env") or {}).items():
         out[var] = str((pack / rel).resolve())
 
-    # Never let the HOST's user site-packages shadow the pack's own SDKs.
-    #
-    # The packed interpreter is a standard CPython, so it still reads
-    # ~/.local/lib/python3.X/site-packages when the minor version matches.
-    # A host that has ever `pip install --user`-ed strobes_pt therefore wins
-    # over the packed copy, silently and only for whichever modules the stale
-    # copy happens to have -- caught exactly that way in testing: every SDK
-    # imported fine while `strobes_pt.flows` raised ModuleNotFoundError,
-    # because a months-old user-site copy predated that module. The failure
-    # looks like a missing feature, not a shadowed install, which is what
-    # makes it expensive to debug on someone else's machine.
-    out["PYTHONNOUSERSITE"] = "1"
-
     # Where the baked system skills live, for the skill loader to point
     # ~/.strobes/skills at instead of shipping bytes per load.
     skills = pack / "skills"
     if skills.is_dir():
         out["STROBES_PACK_SKILLS_DIR"] = str(skills.resolve())
+
+        # Only NOW is it safe to hide the host's user site-packages.
+        #
+        # The packed interpreter is a standard CPython, so it still reads
+        # ~/.local/lib/python3.X/site-packages when the minor version
+        # matches. A host that has ever `pip install --user`-ed strobes_pt
+        # therefore shadows the packed copy, silently and only for whichever
+        # modules the stale copy happens to have -- seen exactly that way:
+        # every SDK imported while `strobes_pt.flows` raised
+        # ModuleNotFoundError, because a months-old user-site copy predated
+        # that module. That reads as a missing feature, not a shadowed
+        # install, which is what makes it expensive to debug remotely.
+        #
+        # But setting this unconditionally is worse than the bug. A pack
+        # built before skills were baked has NO SDKs of its own, so user
+        # site is the only place they exist -- and on a live bridge running
+        # pack v0.4.1 this turned all four SDKs from present to MISSING.
+        # Gating on the baked skills dir ties the isolation to the thing
+        # that makes it survivable, so old packs keep working and new ones
+        # stop being shadowed.
+        out["PYTHONNOUSERSITE"] = "1"
     return out
 
 
