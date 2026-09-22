@@ -549,6 +549,110 @@ def pip_freeze(uv: str, pybin: Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+#: package name -> the skill slug whose scripts/ dir holds it. Mirrors
+#: strobes-sandbox's Dockerfile and the backend's sandbox_bootstrap: one
+#: source of truth (strobes-co/skills), three surfaces that bake it.
+SDK_PACKAGES = {
+    "strobes_cr": "code-review-toolkit",
+    "strobes_pt": "web-code-toolkit",
+    "strobes_cloud": "cloud-review-toolkit",
+    "strobes_net": "network-pentest-toolkit",
+}
+
+
+def install_skills(uv: str, pybin: Path, pack: Path, skills_src: Path) -> dict:
+    """Bake the system-skill catalog + the 4 SDKs into the pack.
+
+    Why the pack and not a fetch-at-connect: a bridge runs on a customer host
+    that may have no route to our S3 at all, and a first connect that has to
+    pull ~200 files before the agent can do anything is the slowest possible
+    moment to discover that. The pack is already the thing the bridge
+    auto-updates (pack.needs_update / update_pack), so skills ride the same
+    mechanism as the CLI tools and the bundled interpreter.
+
+    Two halves, same as the MicroVM image:
+
+    * ``pack/skills/<slug>/`` -- scripts, references and assets, at the path
+      ``~/.strobes/skills/<slug>/`` that SKILL.md's own text names. The daemon
+      points that directory at this one.
+    * the 4 SDKs pip-installed into the pack's bundled interpreter, so
+      ``import strobes_pt`` works with no sys.path preamble from the agent.
+
+    SKILL.md is deliberately NOT baked. It is agent-facing prompt content,
+    always served fresh from S3 by the backend, so a wording fix ships without
+    a pack release. Baking it would create a second, staler copy that nothing
+    reads.
+
+    Returns ``{slug: sha256}`` for the manifest, so any skill change bumps the
+    pack version and every bridge notices it is stale.
+    """
+    src = skills_src / "skills"
+    if not src.is_dir():
+        raise SystemExit(f"--skills-src has no skills/ dir: {skills_src}")
+
+    dest = pack / "skills"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest, ignore=shutil.ignore_patterns(
+        "__pycache__", "*.pyc", "._*",
+    ))
+
+    # SKILL.md is KEPT, deliberately.
+    #
+    # It used to be stripped here (and the MicroVM image did the same) on the
+    # reasoning that it is agent-facing prompt text always served fresh from
+    # S3, so a wording fix should not need a release. That held while nothing
+    # was baked. Now that both surfaces bake the catalog, load_skill reads the
+    # instructions off the mount instead of shipping them over the wire -- and
+    # it cannot do that if the one file holding the instructions is the one
+    # file missing. The trade is explicit: a wording change now rides a pack
+    # release, in exchange for no per-load fetch and no S3 at runtime.
+    kept = len(list(dest.rglob("SKILL.md")))
+
+    # pip-install each SDK into the pack's own interpreter. None of them ship
+    # packaging metadata, so generate a pyproject transiently and remove it --
+    # exactly what strobes-sandbox's Dockerfile does, for the same reason.
+    for pkg, slug in sorted(SDK_PACKAGES.items()):
+        scripts = dest / slug / "scripts"
+        if not (scripts / pkg).is_dir():
+            print(f"      WARNING: {slug}/scripts/{pkg} absent -- skipping {pkg}")
+            continue
+        pyproject = scripts / "pyproject.toml"
+        pyproject.write_text(
+            "[build-system]\n"
+            'requires = ["setuptools>=61.0"]\n'
+            'build-backend = "setuptools.build_meta"\n\n'
+            "[project]\n"
+            f'name = "{pkg.replace("_", "-")}"\n'
+            'version = "0.0.0"\n'
+            'requires-python = ">=3.12"\n\n'
+            "[tool.setuptools]\n"
+            f'packages = ["{pkg}"]\n'
+        )
+        try:
+            run([uv, "pip", "install", "--python", str(pybin),
+                 "--break-system-packages", str(scripts)])
+        finally:
+            pyproject.unlink(missing_ok=True)
+            for junk in ("build",):
+                shutil.rmtree(scripts / junk, ignore_errors=True)
+            for egg in scripts.glob("*.egg-info"):
+                shutil.rmtree(egg, ignore_errors=True)
+        print(f"      installed {pkg} from {slug}")
+
+    lock = {}
+    for slug_dir in sorted(p for p in dest.iterdir() if p.is_dir()):
+        h = hashlib.sha256()
+        for f in sorted(slug_dir.rglob("*")):
+            if f.is_file():
+                h.update(f.relative_to(dest).as_posix().encode())
+                h.update(f.read_bytes())
+        lock[slug_dir.name] = h.hexdigest()
+
+    print(f"      {len(lock)} skills baked, {kept} SKILL.md kept")
+    return lock
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -564,6 +668,10 @@ def main() -> int:
     ap.add_argument("--no-templates", action="store_true",
                     help="skip bundling nuclei-templates (faster builds/tests)")
     ap.add_argument("--tar", action="store_true", help="also produce a .tar.gz")
+    ap.add_argument("--skills-src", default=None,
+                    help="checkout of strobes-co/skills to bake into the pack")
+    ap.add_argument("--no-skills", action="store_true",
+                    help="skip baking the skill catalog + SDKs")
     args = ap.parse_args()
 
     uv = find_uv(args.uv)
@@ -588,6 +696,14 @@ def main() -> int:
     print("[3/5] installing packages into interpreter …")
     lockfile = install_packages(uv, pybin, req_ins, pack, pack_name)
     relocate_fixup(pack, pybin)
+
+    skills_lock = {}
+    if not args.no_skills and args.skills_src:
+        print("[3b] baking system skills + SDKs …")
+        skills_lock = install_skills(
+            uv, pybin, pack, Path(args.skills_src).resolve())
+    elif not args.no_skills:
+        print("[3b] no --skills-src given -- pack will ship no skills")
 
     tools_lock, tools_env, tools_bin_dirs = {}, {}, []
     if not args.no_tools:
@@ -616,6 +732,9 @@ def main() -> int:
         _h.update(args.profile.encode())
         _h.update(json.dumps(tools_lock, sort_keys=True).encode())
         _h.update(json.dumps(packages, sort_keys=True).encode())
+        # Without this a skills-only release produces a byte-identical version
+        # and no bridge would ever pull it.
+        _h.update(json.dumps(skills_lock, sort_keys=True).encode())
         pack_version = "sha-" + _h.hexdigest()[:16]
     manifest = {
         "schema": 1,
@@ -633,6 +752,7 @@ def main() -> int:
         "env": tools_env,        # runtime env vars (pack-relative), e.g. {"NMAPDIR": "..."}
         "bin_dirs": tools_bin_dirs,  # extra PATH dirs (pack-relative), e.g. Windows nmap dir
         "nuclei": nuclei_cfg,    # {templates, config} pack-relative, or null
+        "skills": skills_lock,   # {slug: sha256} of the baked catalog
     }
     (pack / "pack.manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"      version: {pack_version}  packages: {len(packages)}  tools: {len(tools_lock)}")

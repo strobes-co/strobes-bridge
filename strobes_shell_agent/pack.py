@@ -164,7 +164,84 @@ def _extra_env() -> dict:
     out = {}
     for var, rel in (_manifest(pack).get("env") or {}).items():
         out[var] = str((pack / rel).resolve())
+
+    # Where the baked system skills live, for the skill loader to point
+    # ~/.strobes/skills at instead of shipping bytes per load.
+    skills = pack / "skills"
+    if skills.is_dir():
+        out["STROBES_PACK_SKILLS_DIR"] = str(skills.resolve())
+        link_baked_skills(skills)
+
+        # Only NOW is it safe to hide the host's user site-packages.
+        #
+        # The packed interpreter is a standard CPython, so it still reads
+        # ~/.local/lib/python3.X/site-packages when the minor version
+        # matches. A host that has ever `pip install --user`-ed strobes_pt
+        # therefore shadows the packed copy, silently and only for whichever
+        # modules the stale copy happens to have -- seen exactly that way:
+        # every SDK imported while `strobes_pt.flows` raised
+        # ModuleNotFoundError, because a months-old user-site copy predated
+        # that module. That reads as a missing feature, not a shadowed
+        # install, which is what makes it expensive to debug remotely.
+        #
+        # But setting this unconditionally is worse than the bug. A pack
+        # built before skills were baked has NO SDKs of its own, so user
+        # site is the only place they exist -- and on a live bridge running
+        # pack v0.4.1 this turned all four SDKs from present to MISSING.
+        # Gating on the baked skills dir ties the isolation to the thing
+        # that makes it survivable, so old packs keep working and new ones
+        # stop being shadowed.
+        out["PYTHONNOUSERSITE"] = "1"
     return out
+
+
+def link_baked_skills(skills_dir: Path) -> int:
+    """Point ``~/.strobes/skills/<slug>`` at each baked skill in the pack.
+
+    Exposing STROBES_PACK_SKILLS_DIR alone was not enough: every SKILL.md,
+    every skill's own self-heal text and ~12 backend call sites all name
+    ``~/.strobes/skills/<slug>/``, so that is the path the agent actually
+    looks in. Without these links the pack ships the catalog and the agent
+    never sees it -- the same mistake the MicroVM image made by baking to
+    /root while HOME was the per-context dir.
+
+    Linked PER SLUG rather than symlinking the whole directory, because
+    ``~/.strobes/skills`` is also where ORG skills are written at runtime. A
+    directory symlink would send those writes inside the pack, which is
+    shared and may be read-only.
+
+    A real directory already at a slug wins: it may hold an org skill, or a
+    system skill whose bytes were shipped before the pack had it. Never
+    raises -- a failure here means "no baked skills", i.e. the pre-pack
+    behaviour where load_skill ships the bytes.
+    """
+    dest = Path.home() / ".strobes" / "skills"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning(f"cannot create {dest}: {e}")
+        return 0
+
+    linked = 0
+    for baked in sorted(skills_dir.iterdir()):
+        if not baked.is_dir():
+            continue
+        link = dest / baked.name
+        try:
+            if link.is_symlink():
+                if os.readlink(str(link)) == str(baked):
+                    linked += 1
+                    continue
+                link.unlink()
+            elif link.exists():
+                continue
+            link.symlink_to(baked, target_is_directory=True)
+            linked += 1
+        except OSError:
+            continue
+    if linked:
+        log.info(f"Linked {linked} baked skills into {dest}")
+    return linked
 
 
 @lru_cache(maxsize=1)
