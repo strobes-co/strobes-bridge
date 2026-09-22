@@ -40,6 +40,7 @@ PACK_PATH_ENV = "STROBES_PACK_PATH"   # explicit extracted-pack dir
 PACK_DIR_ENV = "STROBES_PACK_DIR"     # root that holds <triple>/ subdirs
 PACK_URL_ENV = "STROBES_PACK_URL"     # base URL to fetch packs from
 PACK_DISABLE_ENV = "STROBES_PACK_DISABLE"  # set truthy to ignore any pack
+PACK_ALLOW_UNVERIFIED_ENV = "STROBES_PACK_ALLOW_UNVERIFIED"  # opt out of sha256
 
 DEFAULT_ROOT = Path.home() / ".strobes-shell-agent" / "pack"
 
@@ -450,7 +451,14 @@ def _download_pack(base_url: str, root: Path, timeout: int = 300) -> bool:
         log.info("downloading sandbox pack: %s", url)
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td) / fname
-            urllib.request.urlretrieve(url, tmp)  # noqa: S310 (operator-configured URL)
+            # urlretrieve takes no timeout, so the `timeout` threaded down here
+        # from ensure_pack/update_pack did nothing: a stalled or slow-loris
+        # pack host hung this thread forever, and every server-pushed update
+        # naming it leaked another one.
+        with urllib.request.urlopen(url, timeout=timeout) as resp, open(
+            tmp, "wb"
+        ) as fh:
+            shutil.copyfileobj(resp, fh, 1024 * 256)  # noqa: S310 (operator-configured URL)
             expected = _fetch_expected_sha(url)
             if expected:
                 got = _sha256(tmp)
@@ -459,7 +467,31 @@ def _download_pack(base_url: str, root: Path, timeout: int = 300) -> bool:
                     return False
                 log.info("pack sha256 verified")
             else:
-                log.warning("no .sha256 alongside pack; skipping integrity check")
+                if os.environ.get(
+                    PACK_ALLOW_UNVERIFIED_ENV, ""
+                ).strip().lower() in ("1", "true", "yes"):
+                    log.warning(
+                        "no .sha256 alongside pack and %s is set -- "
+                        "installing an UNVERIFIED pack from %s",
+                        PACK_ALLOW_UNVERIFIED_ENV,
+                        url,
+                    )
+                else:
+                    # Fail CLOSED. This used to warn and carry on, which
+                    # made the only integrity check self-disabling: a
+                    # missing sidecar (bad bucket, wrong content-type, or
+                    # an attacker who simply omits it) skipped verification
+                    # entirely. The pack supplies the interpreter every
+                    # later command runs under and is prepended to PATH, so
+                    # an unverified pack is unconditional code execution on
+                    # this host.
+                    log.error(
+                        "refusing pack from %s: no .sha256 alongside it. "
+                        "Set %s=1 to install unverified.",
+                        url,
+                        PACK_ALLOW_UNVERIFIED_ENV,
+                    )
+                    return False
             with tarfile.open(tmp) as tar:
                 _safe_extract(tar, root)
         return True
@@ -531,6 +563,31 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
         target = (dest / member.name).resolve()
         if not str(target).startswith(str(dest) + os.sep) and target != dest:
             raise RuntimeError(f"unsafe path in archive: {member.name}")
+
+        # Link TARGETS need the same check as entry names, and did not get
+        # it. A member named `skills/evil` passes the check above however
+        # absurd its linkname is, so an archive could ship
+        # `skills/evil -> /home/<user>` and have it created verbatim. On
+        # Python >= 3.12 the `filter="data"` call below rejects that
+        # independently, but this package declares requires-python >= 3.9,
+        # so the unfiltered fallback is reachable on a real install.
+        #
+        # It matters more now that skills are baked: _extra_env links every
+        # directory under pack/skills into ~/.strobes/skills, and is_dir()
+        # follows symlinks -- so one escaping link in the archive becomes a
+        # permanent, agent-visible door into the host filesystem, at a path
+        # a dozen backend call sites read.
+        if member.issym() or member.islnk():
+            link_target = (
+                (dest / member.name).parent / member.linkname
+            ).resolve()
+            if (
+                not str(link_target).startswith(str(dest) + os.sep)
+                and link_target != dest
+            ):
+                raise RuntimeError(
+                    f"unsafe link in archive: {member.name} -> {member.linkname}"
+                )
     # Python 3.12+ supports a data filter; fall back for older runtimes.
     if sys.version_info >= (3, 12):
         tar.extractall(dest, filter="data")
