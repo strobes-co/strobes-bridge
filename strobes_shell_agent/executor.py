@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import os
 import platform
 import re
@@ -12,6 +13,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import urllib.error
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional
 
@@ -155,8 +159,23 @@ async def execute_shell_command(
     timeout: int = 60,
     cwd: Optional[str] = None,
 ) -> dict:
-    """Execute a shell command via subprocess. Spawns in its own process group
-    so a timeout kills any child processes the command may have started."""
+    """Execute a shell command inside the egress-scoped sandbox.
+
+    The sandbox is the only execution path: see :mod:`sandbox`. Host execution
+    is kept below as ``_execute_shell_command_host`` for tests and tooling that
+    explicitly want it, but the bridge never reaches for it — running a command
+    unsandboxed would mean reporting a scope that is not being applied.
+    """
+    from strobes_shell_agent import sandbox
+    return await sandbox.get_lane().run_shell(command, timeout=timeout, cwd=cwd)
+
+
+async def _execute_shell_command_host(
+    command: str,
+    timeout: int = 60,
+    cwd: Optional[str] = None,
+) -> dict:
+    """Legacy host-subprocess execution — no egress enforcement. Tests only."""
     start = time.monotonic()
     if cwd and not os.path.isdir(cwd):
         cwd = None
@@ -324,13 +343,22 @@ def bg_start(
     out_f = open(workdir / "stdout", "wb")
     err_f = open(workdir / "stderr", "wb")
 
+    # Background jobs carry the long-running scan traffic, so they are confined
+    # exactly like foreground ones: the sandbox wrapper becomes the argv, and
+    # the proxy environment rides along to every child it spawns.
+    from strobes_shell_agent import sandbox as _sandbox
+    try:
+        argv, env = _sandbox.confine(command)
+    except _sandbox.SandboxUnavailable as e:
+        out_f.close(); err_f.close()
+        return {"success": False, "error": str(e)}
+
     popen_kwargs = {
         "stdout": out_f,
         "stderr": err_f,
         "stdin": subprocess.DEVNULL,
         "cwd": cwd,
-        "env": pack.build_env(),
-        "shell": True,
+        "env": env,
     }
     if IS_WINDOWS:
         popen_kwargs["creationflags"] = _WIN_DETACHED_FLAGS
@@ -340,7 +368,7 @@ def bg_start(
         popen_kwargs["start_new_session"] = True
 
     try:
-        proc = subprocess.Popen(command, **popen_kwargs)
+        proc = subprocess.Popen(argv, **popen_kwargs)
     except Exception as e:
         out_f.close()
         err_f.close()
@@ -472,6 +500,11 @@ async def execute_code(
         f.write(code)
         temp_path = f.name
 
+    # The command may run as a different account than the bridge (the
+    # packet-filter lane), in which case it cannot read what we just wrote.
+    from strobes_shell_agent import sandbox as _sandbox
+    _sandbox.adopt_path(temp_path)
+
     try:
         # Quote the interpreter + script path for the target shell. shlex.quote is
         # POSIX-only: on Windows it emits SINGLE quotes, which cmd.exe cannot parse
@@ -579,42 +612,88 @@ def list_files(directory: str = ".", pattern: Optional[str] = None, recursive: b
         return {"success": False, "error": str(e)}
 
 
-def upload_file(path: str, content_b64: str) -> dict:
-    """Upload a file (base64-encoded content)."""
+_ALLOWED_URL_SCHEMES = ("https", "http")
+
+
+def _reject_bad_scheme(url: str) -> Optional[dict]:
+    """Only fetch/PUT https(+http) presigned URLs — never file://, ftp://, etc.
+    Defence-in-depth: the command channel is trusted, but this closes local-file
+    read / SSRF if a URL ever comes from untrusted input."""
+    if urlparse(url).scheme not in _ALLOWED_URL_SCHEMES:
+        return {"success": False, "error": f"refused URL scheme in: {url[:60]}"}
+    return None
+
+
+def file_pull(path: str, url: str, sha256: Optional[str] = None,
+              timeout: int = 300) -> dict:
+    """Download a workspace file onto this machine from a presigned S3 URL.
+
+    Replaces the old base64-over-WebSocket ``file_upload``: the platform mints a
+    one-time presigned GET, the daemon streams it straight to disk. No 10 MB
+    frame cap, no base64 inflation. Fails loudly (no fallback) if the fetch or
+    the optional integrity check does not succeed.
+    """
+    bad = _reject_bad_scheme(url)
+    if bad:
+        return bad
     try:
         p = Path(path).expanduser().resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
-        data = base64.b64decode(content_b64)
-        p.write_bytes(data)
-        return {"success": True, "path": str(p), "size": len(data)}
+        req = urllib.request.Request(url, method="GET")
+        h = hashlib.sha256()
+        size = 0
+        tmp = p.with_name(p.name + ".strobes-part")
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                size += len(chunk)
+        digest = h.hexdigest()
+        if sha256 and digest.lower() != sha256.lower():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return {"success": False,
+                    "error": f"sha256 mismatch: got {digest}, expected {sha256}"}
+        os.replace(tmp, p)
+        return {"success": True, "path": str(p), "size": size, "sha256": digest}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "error": f"HTTP {e.code} fetching presigned URL: {e.reason}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def download_file(path: str) -> dict:
-    """Download a file (returns base64-encoded content).
+def file_push(path: str, url: str, content_type: str = "application/octet-stream",
+              timeout: int = 300) -> dict:
+    """Upload a file from this machine to a presigned S3 URL (one-time PUT).
 
-    The WebSocket max frame is 10MB and base64 inflates by ~33%, so the
-    raw file limit is set so the encoded payload still fits.
+    Replaces the old base64 ``file_download``: the platform mints a presigned
+    PUT and reads the object back with its own credentials afterwards, so there
+    is no per-frame size ceiling and nothing is base64-encoded over the wire.
     """
+    bad = _reject_bad_scheme(url)
+    if bad:
+        return bad
     try:
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return {"success": False, "error": f"File not found: {path}"}
         if not p.is_file():
             return {"success": False, "error": f"Not a file: {path}"}
-
-        # Leave 256 KB headroom for the JSON envelope.
-        RAW_LIMIT = 7_700_000
-        size = p.stat().st_size
-        if size > RAW_LIMIT:
-            return {
-                "success": False,
-                "error": f"File too large: {size} bytes (max {RAW_LIMIT} bytes after base64 inflation)",
-            }
-
-        content = base64.b64encode(p.read_bytes()).decode()
-        return {"success": True, "content_b64": content, "size": size}
+        data = p.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        req = urllib.request.Request(url, data=data, method="PUT")
+        req.add_header("Content-Type", content_type)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            code = r.status
+        return {"success": True, "path": str(p), "size": len(data),
+                "sha256": sha256, "status": code}
+    except urllib.error.HTTPError as e:
+        return {"success": False, "error": f"HTTP {e.code} on presigned PUT: {e.reason}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -634,7 +713,8 @@ def get_env_info() -> dict:
     # Check for common tools, honouring the sandbox pack's bin/ dir if present.
     env_path = pack.build_env().get("PATH")
     tools = {}
-    for tool in ["python3", "node", "npm", "git", "docker", "nmap", "curl", "wget",
+    python_tool = "python" if sys.platform == "win32" else "python3"
+    for tool in [python_tool, "node", "npm", "git", "docker", "nmap", "curl", "wget",
                  "nuclei", "httpx", "subfinder", "ffuf", "gobuster"]:
         tools[tool] = shutil.which(tool, path=env_path) is not None
     info["tools"] = tools

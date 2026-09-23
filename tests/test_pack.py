@@ -3,12 +3,16 @@
 import io
 import json
 import os
+import sys
 import tarfile
 from pathlib import Path
 
 import pytest
 
 from strobes_shell_agent import pack
+
+# Windows installs ship "python", not the POSIX-convention "python3".
+HOST_PYTHON = "python" if sys.platform == "win32" else "python3"
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +63,7 @@ def test_triple_format():
 
 def test_no_pack_is_graceful(monkeypatch):
     assert pack.find_pack() is None
-    assert pack.python_interpreter() == "python3"
+    assert pack.python_interpreter() == HOST_PYTHON
     assert pack.build_env()["PATH"] == os.environ["PATH"]
     assert pack.status() == {"present": False, "triple": pack.triple()}
 
@@ -96,7 +100,7 @@ def test_disable_overrides_everything(tmp_path, monkeypatch):
     monkeypatch.setenv(pack.PACK_DISABLE_ENV, "1")
     pack.find_pack.cache_clear()
     assert pack.find_pack() is None
-    assert pack.python_interpreter() == "python3"
+    assert pack.python_interpreter() == HOST_PYTHON
 
 
 def test_invalid_pack_path_ignored(tmp_path, monkeypatch):

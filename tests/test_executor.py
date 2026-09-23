@@ -17,9 +17,9 @@ from strobes_shell_agent.executor import (
     read_file,
     write_file,
     list_files,
-    download_file,
-    upload_file,
     windows_shell_compat,
+    file_pull,
+    file_push,
 )
 
 IS_WINDOWS = sys.platform == "win32"
@@ -221,27 +221,84 @@ def test_list_files(tmp_path):
     assert {"a.txt", "b.txt"}.issubset(names)
 
 
-def test_download_size_limit(tmp_path):
-    """download_file must reject payloads that would exceed the WS frame."""
-    big = tmp_path / "big.bin"
-    big.write_bytes(b"x" * 8_000_000)  # 8 MB raw → ~10.7 MB base64
-    r = download_file(str(big))
+import hashlib
+import http.server
+import socketserver
+import threading
+
+
+class _FakeS3(http.server.BaseHTTPRequestHandler):
+    """PUT stores an object, GET serves it — stands in for a presigned URL."""
+    store = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_PUT(self):
+        n = int(self.headers.get("Content-Length", 0))
+        _FakeS3.store[self.path] = self.rfile.read(n)
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self):
+        data = _FakeS3.store.get(self.path)
+        if data is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture
+def fake_s3():
+    _FakeS3.store.clear()
+    httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _FakeS3)
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    yield f"http://127.0.0.1:{port}"
+    httpd.shutdown()
+
+
+def test_file_push_no_size_cap(tmp_path, fake_s3):
+    """file_push streams straight to S3 — no 7.7 MB base64 ceiling."""
+    p = tmp_path / "big.bin"
+    payload = os.urandom(9_000_000)  # 9 MB, over the old WS-frame limit
+    p.write_bytes(payload)
+    r = file_push(str(p), f"{fake_s3}/obj/big")
+    assert r["success"] is True
+    assert r["size"] == len(payload)
+    assert r["sha256"] == hashlib.sha256(payload).hexdigest()
+
+
+def test_file_pull_roundtrip_and_integrity(tmp_path, fake_s3):
+    src = tmp_path / "src.bin"
+    payload = b"binary\x00data" * 1000
+    src.write_bytes(payload)
+    file_push(str(src), f"{fake_s3}/obj/rt")
+    sha = hashlib.sha256(payload).hexdigest()
+
+    dst = tmp_path / "dst.bin"
+    r = file_pull(str(dst), f"{fake_s3}/obj/rt", sha256=sha)
+    assert r["success"] is True
+    assert dst.read_bytes() == payload
+
+
+def test_file_pull_bad_sha_fails_loud(tmp_path, fake_s3):
+    src = tmp_path / "s.bin"
+    src.write_bytes(b"hello")
+    file_push(str(src), f"{fake_s3}/obj/s")
+    dst = tmp_path / "out.bin"
+    r = file_pull(str(dst), f"{fake_s3}/obj/s", sha256="deadbeef")
     assert r["success"] is False
-    assert "too large" in r["error"]
+    assert "sha256 mismatch" in r["error"]
+    assert not dst.exists()  # partial cleaned up
 
 
-def test_download_under_limit(tmp_path):
-    p = tmp_path / "small.bin"
-    p.write_bytes(b"hello")
-    r = download_file(str(p))
-    assert r["success"] is True
-    assert r["size"] == 5
-
-
-def test_upload_roundtrip(tmp_path):
-    import base64
-    p = tmp_path / "uploaded.bin"
-    payload = b"binary\x00data"
-    r = upload_file(str(p), base64.b64encode(payload).decode())
-    assert r["success"] is True
-    assert p.read_bytes() == payload
+def test_file_pull_missing_object_fails_loud(tmp_path, fake_s3):
+    r = file_pull(str(tmp_path / "x.bin"), f"{fake_s3}/obj/missing")
+    assert r["success"] is False
+    assert "404" in r["error"]

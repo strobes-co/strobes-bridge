@@ -13,6 +13,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from strobes_shell_agent import pack
+from strobes_shell_agent import sandbox
 from strobes_shell_agent import selfupdate
 from strobes_shell_agent import sessions
 from strobes_shell_agent import responder
@@ -23,8 +24,8 @@ from strobes_shell_agent.executor import (
     read_file,
     write_file,
     list_files,
-    upload_file,
-    download_file,
+    file_pull,
+    file_push,
     get_env_info,
     bg_start,
     bg_poll,
@@ -345,8 +346,21 @@ class ShellBridgeClient:
         except Exception as e:
             logger.error(f"Failed to send response for {request_id}: {e}", exc_info=True)
 
+    #: Commands that launch their own process off the event loop, so the
+    #: execution lane must already be listening before they are dispatched.
+    _NEEDS_LANE = frozenset({
+        "shell_bg_start", "session_create", "session_exec",
+    })
+
     async def _dispatch_command(self, command: str, params: dict) -> dict:
         """Dispatch a command to the appropriate executor."""
+        if command in self._NEEDS_LANE:
+            try:
+                await sandbox.ensure_ready()
+            except Exception as e:
+                # Refuse rather than fall through to an unconfined launch.
+                return {"success": False, "error": f"sandbox unavailable: {e}"}
+
         if command == "shell_execute":
             return await execute_shell_command(
                 command=params.get("command", ""),
@@ -365,6 +379,23 @@ class ShellBridgeClient:
         # --- Background jobs (detached; platform polls) ---
         # Run in a worker thread: bg_cancel can block on taskkill, and none of
         # these should stall the daemon's event loop.
+        elif command == "sandbox_configure":
+            # Platform-pushed egress scope. Takes effect on the next connection
+            # any command makes — the proxy reads the policy per connection.
+            return await sandbox.configure(
+                allow=params.get("allow"),
+                deny=params.get("deny"),
+                default_egress=params.get("default_egress"),
+                block_metadata=params.get("block_metadata"),
+            )
+
+        elif command == "sandbox_status":
+            return {"success": True, **sandbox.describe_policy()}
+
+        elif command == "sandbox_selftest":
+            # Proves egress is actually confined on this host.
+            return {"success": True, **(await sandbox.selftest())}
+
         elif command == "shell_bg_start":
             return await asyncio.to_thread(
                 bg_start,
@@ -451,14 +482,25 @@ class ShellBridgeClient:
                 recursive=params.get("recursive", False),
             )
 
-        elif command == "file_upload":
-            return upload_file(
-                path=params.get("path", ""),
-                content_b64=params.get("content_b64", ""),
+        elif command == "file_pull":
+            # workspace -> machine, via one-time presigned S3 GET
+            return await asyncio.to_thread(
+                file_pull,
+                params.get("path", ""),
+                params.get("url", ""),
+                params.get("sha256"),
+                params.get("timeout", 300),
             )
 
-        elif command == "file_download":
-            return download_file(params.get("path", ""))
+        elif command == "file_push":
+            # machine -> workspace, via one-time presigned S3 PUT
+            return await asyncio.to_thread(
+                file_push,
+                params.get("path", ""),
+                params.get("url", ""),
+                params.get("content_type", "application/octet-stream"),
+                params.get("timeout", 300),
+            )
 
         elif command == "env_info":
             return get_env_info()
