@@ -451,49 +451,60 @@ def _download_pack(base_url: str, root: Path, timeout: int = 300) -> bool:
         log.info("downloading sandbox pack: %s", url)
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td) / fname
-            # urlretrieve takes no timeout, so the `timeout` threaded down here
-        # from ensure_pack/update_pack did nothing: a stalled or slow-loris
-        # pack host hung this thread forever, and every server-pushed update
-        # naming it leaked another one.
-        with urllib.request.urlopen(url, timeout=timeout) as resp, open(
-            tmp, "wb"
-        ) as fh:
-            shutil.copyfileobj(resp, fh, 1024 * 256)  # noqa: S310 (operator-configured URL)
-            expected = _fetch_expected_sha(url)
-            if expected:
-                got = _sha256(tmp)
-                if got != expected:
-                    log.error("pack sha256 mismatch (want %s got %s) — refusing", expected, got)
-                    return False
-                log.info("pack sha256 verified")
-            else:
-                if os.environ.get(
-                    PACK_ALLOW_UNVERIFIED_ENV, ""
-                ).strip().lower() in ("1", "true", "yes"):
-                    log.warning(
-                        "no .sha256 alongside pack and %s is set -- "
-                        "installing an UNVERIFIED pack from %s",
-                        PACK_ALLOW_UNVERIFIED_ENV,
-                        url,
-                    )
+            # urlretrieve takes no timeout, so the `timeout` threaded down
+            # here from ensure_pack/update_pack did nothing: a stalled or
+            # slow-loris pack host hung this thread forever, and every
+            # server-pushed update naming it leaked another one.
+            #
+            # This block MUST stay inside the TemporaryDirectory above. It
+            # was dedented out of it when urlretrieve was replaced, so the
+            # directory was destroyed on the way out and the very next line
+            # opened a file inside a path that no longer existed. Every
+            # download failed instantly and identically:
+            #     FileNotFoundError: [Errno 2] No such file or directory:
+            #     '/var/folders/.../tmpXXXXXXXX/strobes-sandbox-pack-<triple>.tar.gz'
+            # which took out server-driven updates AND first-provision, since
+            # ensure_pack shares this function. Caught by watching a real
+            # daemon try to apply a real update.
+            with urllib.request.urlopen(url, timeout=timeout) as resp, open(
+                tmp, "wb"
+            ) as fh:
+                shutil.copyfileobj(resp, fh, 1024 * 256)  # noqa: S310 (operator-configured URL)
+                expected = _fetch_expected_sha(url)
+                if expected:
+                    got = _sha256(tmp)
+                    if got != expected:
+                        log.error("pack sha256 mismatch (want %s got %s) — refusing", expected, got)
+                        return False
+                    log.info("pack sha256 verified")
                 else:
-                    # Fail CLOSED. This used to warn and carry on, which
-                    # made the only integrity check self-disabling: a
-                    # missing sidecar (bad bucket, wrong content-type, or
-                    # an attacker who simply omits it) skipped verification
-                    # entirely. The pack supplies the interpreter every
-                    # later command runs under and is prepended to PATH, so
-                    # an unverified pack is unconditional code execution on
-                    # this host.
-                    log.error(
-                        "refusing pack from %s: no .sha256 alongside it. "
-                        "Set %s=1 to install unverified.",
-                        url,
-                        PACK_ALLOW_UNVERIFIED_ENV,
-                    )
-                    return False
-            with tarfile.open(tmp) as tar:
-                _safe_extract(tar, root)
+                    if os.environ.get(
+                        PACK_ALLOW_UNVERIFIED_ENV, ""
+                    ).strip().lower() in ("1", "true", "yes"):
+                        log.warning(
+                            "no .sha256 alongside pack and %s is set -- "
+                            "installing an UNVERIFIED pack from %s",
+                            PACK_ALLOW_UNVERIFIED_ENV,
+                            url,
+                        )
+                    else:
+                        # Fail CLOSED. This used to warn and carry on, which
+                        # made the only integrity check self-disabling: a
+                        # missing sidecar (bad bucket, wrong content-type, or
+                        # an attacker who simply omits it) skipped verification
+                        # entirely. The pack supplies the interpreter every
+                        # later command runs under and is prepended to PATH, so
+                        # an unverified pack is unconditional code execution on
+                        # this host.
+                        log.error(
+                            "refusing pack from %s: no .sha256 alongside it. "
+                            "Set %s=1 to install unverified.",
+                            url,
+                            PACK_ALLOW_UNVERIFIED_ENV,
+                        )
+                        return False
+                with tarfile.open(tmp) as tar:
+                    _safe_extract(tar, root)
         return True
     except Exception as e:  # noqa: BLE001 — provisioning must never crash the daemon
         log.error("sandbox pack download failed: %s", e)
