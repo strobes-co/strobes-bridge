@@ -34,11 +34,32 @@ permissions:
   contents: write
 
 env:
-  # Stamp the release tag as each pack's manifest version, so a bridge can tell its
-  # pack is stale and auto-pull the new one (pack.needs_update / update_pack). Empty
-  # on non-tag runs (PR / manual dispatch) → build_pack.py falls back to a
-  # deterministic content hash. Docker-container builds get it via `-e` below.
-  STROBES_PACK_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+  # Stamp each pack's manifest version, so a bridge can tell its pack is stale
+  # and auto-pull the new one (pack.needs_update / update_pack). Docker-container
+  # builds get it via `-e` below.
+  #
+  # It MUST be the same string on every platform. The backend advertises ONE
+  # version to every bridge regardless of OS/arch, and needs_update() is a
+  # string equality against the manifest inside whichever pack that bridge
+  # downloaded. build_pack.py's fallback hash covers tools_lock and the pip
+  # freeze, both of which are per-platform, so letting it fall back gives each
+  # platform a DIFFERENT version -- and then no bridge can ever satisfy the
+  # advertised one.
+  #
+  # Caught end to end: a macOS bridge pulled the new pack, verified its
+  # sha256, extracted 112 skills correctly, and then reported
+  #   update_pack: after pull, version is sha-1f8f6a5f448baf26
+  #                (wanted sha-53b4281ba34dbc20)
+  # because pack.version had been read from the linux-x86_64 pack. Left alone
+  # that is a ~417MB re-download on every single reconnect, forever.
+  #
+  # A skills release therefore stamps the skills commit, which is identical
+  # across platforms and changes exactly when the skills do.
+  STROBES_PACK_VERSION: >-
+    ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name
+        || (github.event.client_payload.skills_sha
+            && format('skills-{0}', github.event.client_payload.skills_sha)
+            || '') }}
 
 jobs:
   linux:
@@ -483,8 +504,27 @@ jobs:
           # pack's contents, so it changes exactly when the skills or SDKs do.
           # Read it back out of a built pack rather than recomputing it here,
           # so the advertised version cannot drift from the shipped one.
-          mkdir -p _v && tar -xzf "$(ls dist/strobes-sandbox-pack-linux-x86_64.tar.gz)" -C _v
-          VERSION=$(python3 -c "import glob,json;print(json.load(open(glob.glob('_v/*/pack.manifest.json')[0]))['version'])")
+          # EVERY pack must stamp the same version, because the backend
+          # advertises one string to every bridge whatever its platform. If
+          # they disagree, publishing any one of them guarantees the others
+          # re-download ~417MB on every reconnect and never converge. So
+          # check all of them and fail rather than ship that.
+          VERSION=""
+          for tb in dist/strobes-sandbox-pack-*.tar.gz; do
+            case "$tb" in *internal-ad*) continue;; esac   # addon pack, versioned separately
+            rm -rf _v && mkdir -p _v && tar -xzf "$tb" -C _v
+            V=$(python3 -c "import glob,json;print(json.load(open(glob.glob('_v/*/pack.manifest.json')[0]))['version'])")
+            echo "  $(basename "$tb") -> $V"
+            if [ -z "$VERSION" ]; then
+              VERSION="$V"
+            elif [ "$V" != "$VERSION" ]; then
+              echo "::error::pack versions disagree across platforms ($VERSION vs $V)."
+              echo "::error::STROBES_PACK_VERSION was not set, so build_pack.py fell back"
+              echo "::error::to a per-platform content hash. One advertised version cannot"
+              echo "::error::match them all -- see the env block at the top of this file."
+              exit 1
+            fi
+          done
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Pack version: $VERSION"
 
