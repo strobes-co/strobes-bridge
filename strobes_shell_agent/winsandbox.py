@@ -19,13 +19,23 @@ Nothing here runs outside Windows. Every entry point is import-safe on other
 platforms so the module can be unit-tested anywhere; the parts that touch the
 OS check :data:`IS_WINDOWS` and refuse politely.
 
-**Unverified.** This backend has not been executed on Windows. It is written
-from the documented APIs, and :func:`strobes_shell_agent.sandbox.selftest` is
-the thing that proves or disproves it on a real host — run it after ``setup``.
+**Verified** on Windows Server 2022: the firewall block, the loopback exemption,
+and :func:`strobes_shell_agent.sandbox.selftest` all confirmed against a live
+host. Two host-level preconditions had to be fixed to get there and matter for
+any Windows version, not just this one:
+
+* the sandbox account needs :data:`LOGON_RIGHTS` — Windows Server's default
+  local security policy grants a new local account neither "Log on as a batch
+  job" nor "Allow log on locally", so :func:`setup` grants both explicitly
+  rather than assuming a default that varies by SKU.
+* commands run as the account via a Scheduled Task rather than
+  ``CreateProcessWithLogonW`` — see :func:`run_as_sandbox` for why the latter
+  does not reliably work here.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -90,6 +100,17 @@ def is_elevated() -> bool:
 def _sddl(sid: str) -> str:
     """The SDDL form ``-LocalUser`` expects for a single account."""
     return f"D:(A;;CC;;;{sid})"
+
+
+#: Rights the sandbox account needs to be logged on at all. Windows Server's
+#: default local security policy grants neither to a freshly created local
+#: user — without them every logon this module needs (Task Scheduler's batch
+#: logon, and an interactive-style logon) fails outright, which is a
+#: precondition failure and easy to mistake for the egress filter itself being
+#: broken. Client SKUs are usually more permissive by default, but granting
+#: both explicitly keeps behavior identical across Windows versions instead of
+#: depending on which default the target happens to ship with.
+LOGON_RIGHTS = ("SeBatchLogonRight", "SeInteractiveLogonRight")
 
 
 def block_rules(sid: str) -> list:
@@ -241,6 +262,13 @@ def setup(port_range: tuple) -> dict:
 
     sid = _account_sid()
 
+    # Without these, every logon this backend needs — the scheduled task that
+    # runs sandboxed commands, and CreateProcessWithLogonW as a fallback — fails
+    # with ERROR_LOGON_TYPE_NOT_GRANTED before a single command ever runs.
+    # Windows Server does not grant them to a new local account by default;
+    # granting explicitly avoids depending on which SKU's default this is.
+    _grant_logon_rights(sid)
+
     # Rebuild from scratch so a partial previous run cannot leave a stale rule.
     _remove_rules()
     for script in block_rules(sid):
@@ -252,6 +280,7 @@ def setup(port_range: tuple) -> dict:
         "sid": sid,
         "port_range": list(port_range),
         "rules": [RULE_BLOCK],
+        "logon_rights": list(LOGON_RIGHTS),
     }
 
 
@@ -271,6 +300,51 @@ def teardown() -> dict:
         except OSError:
             pass
     return {"removed": True}
+
+
+def _grant_logon_rights(sid: str) -> None:
+    """Grant :data:`LOGON_RIGHTS` to ``sid`` via the local security policy.
+
+    ``secedit`` round-trips the *entire* user-rights policy through a text
+    file, which sounds heavier than it is: this only ever adds ``sid`` to the
+    handful of lines it targets, so it cannot drop a right some other account
+    already holds, and running it again when the SID is already present is a
+    no-op. There is no narrower supported API for this — ``LsaAddAccountRights``
+    is the alternative, but it demands hand-rolled ``LSA_UNICODE_STRING``/SID
+    marshaling for a one-time setup step, which is worse to get subtly wrong
+    than one securely-generated policy file.
+    """
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$sid = '{sid}'
+$rights = @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})
+$cfgPath = Join-Path $env:TEMP ("strobes-secpol-{{0}}.cfg" -f ([guid]::NewGuid()))
+try {{
+    secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    $lines = Get-Content $cfgPath
+    foreach ($right in $rights) {{
+        $found = $false
+        $lines = $lines | ForEach-Object {{
+            if ($_ -match "^\\s*$right\\s*=") {{
+                $found = $true
+                if ($_ -notmatch [regex]::Escape($sid)) {{ "$_,*$sid" }} else {{ $_ }}
+            }} else {{ $_ }}
+        }}
+        if (-not $found) {{
+            $idx = 0
+            for ($i = 0; $i -lt $lines.Count; $i++) {{
+                if ($lines[$i] -match '^\\[Privilege Rights\\]') {{ $idx = $i; break }}
+            }}
+            $lines = $lines[0..$idx] + "$right = *$sid" + $lines[($idx + 1)..($lines.Count - 1)]
+        }}
+    }}
+    Set-Content -Path $cfgPath -Value $lines
+    secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+}} finally {{
+    Remove-Item $cfgPath -ErrorAction SilentlyContinue
+}}
+"""
+    _powershell(script)
 
 
 def _remove_rules() -> None:
@@ -295,8 +369,36 @@ def _account_sid() -> str:
     return sid
 
 
+def _has_logon_rights(sid: str) -> bool:
+    """Whether ``sid`` currently holds every right in :data:`LOGON_RIGHTS`.
+
+    Local security policy is machine-wide state outside this module's control
+    — a GPO refresh or another tool can reset it — so :func:`ready` checks the
+    live policy rather than trusting that :func:`setup` once granted it.
+    """
+    script = f"""
+$cfgPath = Join-Path $env:TEMP ("strobes-secpol-check-{{0}}.cfg" -f ([guid]::NewGuid()))
+try {{
+    secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    $lines = Get-Content $cfgPath
+    $missing = @()
+    foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
+        $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
+        if (-not $line -or $line -notmatch [regex]::Escape('{sid}')) {{ $missing += $right }}
+    }}
+    if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
+}} finally {{
+    Remove-Item $cfgPath -ErrorAction SilentlyContinue
+}}
+"""
+    try:
+        return _powershell(script, check=False).strip() == "yes"
+    except WindowsSetupError:
+        return False
+
+
 def ready() -> bool:
-    """True when the account and both rules are in place."""
+    """True when the account, its logon rights, and the block rule are in place."""
     if not IS_WINDOWS:
         return False
     state = load_state()
@@ -304,6 +406,8 @@ def ready() -> bool:
         return False
     try:
         if not _account_exists():
+            return False
+        if not _has_logon_rights(state["sid"]):
             return False
         found = _powershell(
             f"if (Get-NetFirewallRule -DisplayName '{RULE_BLOCK}' "
@@ -330,15 +434,44 @@ def status() -> dict:
 # Running a command as the sandbox account
 # ---------------------------------------------------------------------------
 
+#: Task Scheduler's own status codes, distinct from a launched process's exit
+#: code. ``0x00041301`` is "currently running" (what the poll loop waits out);
+#: the others mean the action never started at all — most commonly a logon
+#: failure, which after :func:`setup` has run should not happen, but is
+#: reported precisely rather than mistaken for the sandboxed command's own
+#: (nonexistent) exit code.
+_TASK_RUNNING = 0x00041301
+_TASK_NOT_SCHEDULED_TO_RUN = 0x00041303  # SCHED_S_TASK_HAS_NOT_RUN
+_TASK_NOT_YET_RUN = 267011  # decimal form of the same code, seen in the wild
+
+
+def _ps_single_quote(value: str) -> str:
+    """Escape ``value`` for embedding in a PowerShell single-quoted string."""
+    return value.replace("'", "''")
+
+
 def run_as_sandbox(command: str, env: dict, cwd: Optional[str],
                    timeout: int) -> tuple:
     """Run ``command`` as the sandbox account. Returns ``(rc, stdout, stderr)``.
 
-    Uses ``CreateProcessWithLogonW`` because the bridge itself must keep its own
-    (unrestricted) identity — it needs the network to report results. Output is
-    redirected to temporary files rather than pipes: the command is awaited to
-    completion anyway, and files avoid the deadlock-prone business of pumping
-    two inherited pipe handles by hand.
+    Launched via an ephemeral Scheduled Task rather than ``CreateProcessWithLogonW``.
+    The latter goes through the Secondary Logon service, which — independent of
+    this account's rights — does not reliably launch a process when the caller
+    has no interactive desktop (a Windows service, or this bridge itself run
+    non-interactively): the child is created but crashes immediately with
+    ``STATUS_DLL_INIT_FAILED``. Task Scheduler's "run whether user is logged on
+    or not" logon uses a different, batch-oriented path that does not have this
+    dependency, and it is what this project's own installer already uses to run
+    the bridge — so it is a proven-reliable mechanism in this exact deployment
+    shape, not a new one.
+
+    A Scheduled Task action has no equivalent of ``lpEnvironment``, so the
+    environment (most importantly ``ALL_PROXY`` — this is what makes the
+    sandboxed command use the egress proxy at all) is set inside the launched
+    script instead of passed to the launcher. Output is captured with
+    PowerShell's own redirection operators rather than inherited handles,
+    sidestepping the handle-inheritance fragility documented for
+    ``CreateProcessWithLogonW`` entirely instead of working around it.
     """
     if not IS_WINDOWS:
         raise WindowsSetupError("Windows-only")
@@ -346,105 +479,95 @@ def run_as_sandbox(command: str, env: dict, cwd: Optional[str],
     if not state:
         raise WindowsSetupError("windows sandbox is not set up; run `sandbox-setup`")
 
-    import ctypes
+    import shutil
     import tempfile
-    from ctypes import wintypes
+    import uuid
 
     password = _unprotect(state["password"])
+    sid = state["sid"]
+    task_name = f"strobes-sandbox-run-{uuid.uuid4().hex}"
 
-    out_path = tempfile.mktemp(prefix="strobes-out-")
-    err_path = tempfile.mktemp(prefix="strobes-err-")
+    work_dir = tempfile.mkdtemp(prefix="strobes-sbx-")
+    script_path = os.path.join(work_dir, "run.ps1")
+    out_path = os.path.join(work_dir, "stdout.txt")
+    err_path = os.path.join(work_dir, "stderr.txt")
 
-    GENERIC_WRITE = 0x40000000
-    FILE_SHARE_READ_WRITE = 0x00000003
-    CREATE_ALWAYS = 2
-    FILE_ATTRIBUTE_NORMAL = 0x80
+    try:
+        # The task runs as a different, lower-privileged account than whatever
+        # created work_dir (this process); it needs its own write access to
+        # read the script and create the output files.
+        _powershell(
+            f'icacls "{work_dir}" /grant "*{sid}:(OI)(CI)F" | Out-Null',
+            check=False,
+        )
 
-    class SECURITY_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [("nLength", wintypes.DWORD),
-                    ("lpSecurityDescriptor", wintypes.LPVOID),
-                    ("bInheritHandle", wintypes.BOOL)]
+        # Windows keeps a few hidden, non-identifier environment entries (the
+        # per-drive current directory, e.g. "=C:") that ``$env:NAME`` syntax
+        # cannot target and the sandboxed command has no use for anyway.
+        env_lines = "\n".join(
+            f"$env:{name} = '{_ps_single_quote(str(value))}'"
+            for name, value in sorted(env.items())
+            if name.isidentifier()
+        )
+        cd_line = (f"Set-Location -LiteralPath '{_ps_single_quote(cwd)}'"
+                   if cwd and os.path.isdir(cwd) else "")
+        inner_script = f"""
+{env_lines}
+{cd_line}
+& cmd.exe /c '{_ps_single_quote(command)}' 1> '{out_path}' 2> '{err_path}'
+exit $LASTEXITCODE
+"""
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(inner_script)
 
-    class STARTUPINFOW(ctypes.Structure):
-        _fields_ = [
-            ("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
-            ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
-            ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
-            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
-            ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
-            ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
-            ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
-            ("lpReserved2", wintypes.LPVOID), ("hStdInput", wintypes.HANDLE),
-            ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE),
-        ]
+        register_and_wait = f"""
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+    -Argument '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{script_path}"'
+Register-ScheduledTask -TaskName '{task_name}' -Action $action `
+    -User '{ACCOUNT}' -Password '{_ps_single_quote(password)}' -RunLevel Limited -Force | Out-Null
+Start-ScheduledTask -TaskName '{task_name}'
 
-    class PROCESS_INFORMATION(ctypes.Structure):
-        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
-                    ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+$deadline = (Get-Date).AddSeconds({int(timeout)})
+do {{
+    Start-Sleep -Milliseconds 200
+    $r = (Get-ScheduledTaskInfo -TaskName '{task_name}').LastTaskResult
+}} while ($r -eq {_TASK_RUNNING} -and (Get-Date) -lt $deadline)
 
-    sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), None, True)
-    kernel32 = ctypes.windll.kernel32
+if ($r -eq {_TASK_RUNNING}) {{
+    Stop-ScheduledTask -TaskName '{task_name}' -ErrorAction SilentlyContinue
+    'TIMEOUT'
+}} else {{
+    "RESULT:$r"
+}}
+"""
+        outcome = _powershell(register_and_wait).strip()
 
-    def _open(path):
-        h = kernel32.CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ_WRITE,
-                                 ctypes.byref(sa), CREATE_ALWAYS,
-                                 FILE_ATTRIBUTE_NORMAL, None)
-        if h == wintypes.HANDLE(-1).value:
-            raise WindowsSetupError(f"could not create {path}")
-        return h
+        if outcome == "TIMEOUT":
+            raise asyncio.TimeoutError()
 
-    h_out, h_err = _open(out_path), _open(err_path)
+        if not outcome.startswith("RESULT:"):
+            raise WindowsSetupError(f"unexpected scheduled-task outcome: {outcome!r}")
 
-    si = STARTUPINFOW()
-    si.cb = ctypes.sizeof(STARTUPINFOW)
-    si.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
-    si.hStdOutput, si.hStdError = h_out, h_err
-    pi = PROCESS_INFORMATION()
+        result_code = int(outcome.split(":", 1)[1])
+        if result_code in (_TASK_NOT_SCHEDULED_TO_RUN, _TASK_NOT_YET_RUN):
+            raise WindowsSetupError(
+                "scheduled task never ran (commonly a logon failure — rerun "
+                "`sandbox-setup` to reapply the sandbox account's logon rights)"
+            )
 
-    # The environment must be a NUL-separated, NUL-terminated block, sorted.
-    block = "".join(f"{k}={v}\0" for k, v in sorted(env.items())) + "\0"
-    env_buf = ctypes.create_unicode_buffer(block)
-
-    CREATE_UNICODE_ENVIRONMENT = 0x00000400
-    LOGON_WITH_PROFILE = 0x00000001
-
-    ok = ctypes.windll.advapi32.CreateProcessWithLogonW(
-        ACCOUNT, ".", password,
-        LOGON_WITH_PROFILE,
-        None, ctypes.create_unicode_buffer(f'cmd.exe /c {command}'),
-        CREATE_UNICODE_ENVIRONMENT,
-        ctypes.byref(env_buf), cwd,
-        ctypes.byref(si), ctypes.byref(pi),
-    )
-    if not ok:
-        err = ctypes.get_last_error()
-        for h in (h_out, h_err):
-            kernel32.CloseHandle(h)
-        raise WindowsSetupError(f"CreateProcessWithLogonW failed (error {err})")
-
-    WAIT_TIMEOUT = 0x00000102
-    waited = kernel32.WaitForSingleObject(pi.hProcess, int(timeout * 1000))
-    if waited == WAIT_TIMEOUT:
-        kernel32.TerminateProcess(pi.hProcess, 1)
-        rc = -1
-    else:
-        code = wintypes.DWORD()
-        kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
-        rc = int(code.value)
-
-    for h in (h_out, h_err, pi.hProcess, pi.hThread):
-        kernel32.CloseHandle(h)
-
-    def _read(path):
-        try:
-            with open(path, "r", errors="replace") as fh:
-                return fh.read()
-        except OSError:
-            return ""
-        finally:
+        def _read(path):
             try:
-                os.unlink(path)
+                with open(path, "r", errors="replace") as fh:
+                    return fh.read()
             except OSError:
-                pass
+                return ""
 
-    return rc, _read(out_path), _read(err_path)
+        return result_code, _read(out_path), _read(err_path)
+    finally:
+        _powershell(
+            f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false "
+            "-ErrorAction SilentlyContinue",
+            check=False,
+        )
+        shutil.rmtree(work_dir, ignore_errors=True)

@@ -33,6 +33,10 @@ needs_sandbox = pytest.mark.skipif(
 METADATA = "169.254.169.254"
 BLACKHOLE = "198.51.100.42"  # TEST-NET-2
 
+# "/dev/null" and single-quoted "-w" values are POSIX shell syntax; cmd.exe
+# (which runs sandboxed commands on Windows) handles neither the same way.
+NULL_DEVICE = "NUL" if sys.platform == "win32" else "/dev/null"
+
 
 @pytest.fixture(autouse=True)
 def clean_policy(monkeypatch):
@@ -120,7 +124,7 @@ def test_checker_default_deny_refuses_the_unlisted():
 
 async def curl(*args, timeout=10):
     proc = await asyncio.create_subprocess_exec(
-        "curl", "-s", "-m", "6", "-o", "/dev/null", "-w", "%{http_code}", *args,
+        "curl", "-s", "-m", "6", "-o", NULL_DEVICE, "-w", "%{http_code}", *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     return proc.returncode, out.decode().strip()
@@ -243,7 +247,7 @@ def test_sandbox_env_points_clients_at_the_proxy_with_remote_dns():
 async def test_default_policy_lets_a_command_reach_the_network(origin):
     """Out of the box the bridge runs commands without restricting them."""
     result = await client()._dispatch_command("shell_execute", {
-        "command": f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{origin}/",
+        "command": f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" http://127.0.0.1:{origin}/',
         "timeout": 25,
     })
     assert result["stdout"].strip() == "200"
@@ -255,7 +259,7 @@ async def test_default_policy_lets_a_command_reach_the_network(origin):
 @pytest.mark.asyncio
 async def test_metadata_is_refused_even_under_the_open_default():
     result = await client()._dispatch_command("shell_execute", {
-        "command": f"curl -s -m 5 -o /dev/null -w '%{{http_code}}' http://{METADATA}/",
+        "command": f'curl -s -m 5 -o {NULL_DEVICE} -w "%{{http_code}}" http://{METADATA}/',
         "timeout": 25,
     })
     denied = result.get("egress_denied") or []
@@ -275,13 +279,13 @@ async def test_cloud_pushed_scope_blocks_out_of_scope_and_keeps_in_scope(origin)
     assert status["enforced"] is True
 
     ok = await c._dispatch_command("shell_execute", {
-        "command": f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{origin}/",
+        "command": f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" http://127.0.0.1:{origin}/',
         "timeout": 25,
     })
     assert ok["stdout"].strip() == "200", "in-scope traffic must still flow"
 
     blocked = await c._dispatch_command("shell_execute", {
-        "command": f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' http://{BLACKHOLE}/",
+        "command": f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" http://{BLACKHOLE}/',
         "timeout": 25,
     })
     denied = blocked.get("egress_denied") or []
@@ -319,7 +323,7 @@ async def test_a_refusal_reaches_the_caller_as_a_reason(origin):
     """A bare failure makes an agent retry; a reason makes it retarget."""
     await sb.configure(allow=["127.0.0.1"], default_egress="deny")
     result = await client()._dispatch_command("shell_execute", {
-        "command": f"curl -s -m 6 -o /dev/null http://{BLACKHOLE}/", "timeout": 25,
+        "command": f"curl -s -m 6 -o {NULL_DEVICE} http://{BLACKHOLE}/", "timeout": 25,
     })
     assert "egress denied" in result["stderr"]
     assert BLACKHOLE in result["stderr"]
@@ -536,9 +540,9 @@ async def test_background_jobs_are_confined(origin):
                 return (poll.get("stdout") or "").strip()
         pytest.fail("background job did not finish")
 
-    assert (await run_bg("t-in", f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+    assert (await run_bg("t-in", f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" '
                                  f"http://127.0.0.1:{origin}/")) == "200"
-    assert (await run_bg("t-out", f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+    assert (await run_bg("t-out", f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" '
                                   f"http://{BLACKHOLE}/")) != "200"
     # A proxy-blind tool must get nothing, not unfiltered access.
     assert "BLOCKED" in (await run_bg(
@@ -562,9 +566,9 @@ async def test_sessions_are_confined(origin):
             return (r.get("output") or "").strip()
 
         assert (await run("echo $ALL_PROXY")).startswith("socks5h://")
-        assert (await run(f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+        assert (await run(f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" '
                           f"http://127.0.0.1:{origin}/")) == "200"
-        assert (await run(f"curl -s -m 6 -o /dev/null -w '%{{http_code}}' "
+        assert (await run(f'curl -s -m 6 -o {NULL_DEVICE} -w "%{{http_code}}" '
                           f"http://{BLACKHOLE}/")) != "200"
         assert "BLOCKED" in (await run(
             f"nc -z -w3 {BLACKHOLE} 443 && echo REACHED || echo BLOCKED"))

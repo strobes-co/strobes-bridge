@@ -29,7 +29,6 @@ tell it to trust its capabilities instead, and :func:`environment` sets it.
 from __future__ import annotations
 
 import os
-import pwd
 import shutil
 import subprocess
 import sys
@@ -89,9 +88,18 @@ def status() -> dict:
 # ---------------------------------------------------------------------------
 
 def account_uid() -> Optional[int]:
+    """The account's uid, or ``None`` off Linux or before it exists.
+
+    ``pwd`` is POSIX-only and this module must stay import-safe everywhere
+    (:func:`available` is checked on every platform), so the import is local
+    and its absence is treated the same as the account not existing yet.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
     try:
+        import pwd
         return pwd.getpwnam(ACCOUNT).pw_uid
-    except KeyError:
+    except (ImportError, KeyError):
         return None
 
 

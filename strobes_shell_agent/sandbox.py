@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import tempfile
 import time
 from typing import Optional
@@ -477,16 +478,21 @@ async def selftest() -> dict:
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
+    # ``/dev/null`` and single-quoted ``-w`` values are POSIX shell syntax; the
+    # equivalents here keep this readable under both ``/bin/sh -c`` and
+    # ``cmd.exe /c`` (which strips neither the path nor the quoting the same way).
+    null_device = "NUL" if sys.platform == "win32" else "/dev/null"
+
     lane = Lane(NetworkPolicy.from_lists(allow=["127.0.0.1"], default_egress="deny"))
     try:
         allowed = await lane.run_shell(
-            f"curl -s -m 8 -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{port}/",
+            f'curl -s -m 8 -o {null_device} -w "%{{http_code}}" http://127.0.0.1:{port}/',
             timeout=25,
         )
         reachable = (allowed.get("stdout") or "").strip().endswith("200")
 
         denied_run = await lane.run_shell(
-            f"curl -s -m 8 -o /dev/null -w '%{{http_code}}' http://{blackhole}/",
+            f'curl -s -m 8 -o {null_device} -w "%{{http_code}}" http://{blackhole}/',
             timeout=25,
         )
         # The process exit code is the wrong signal: a refusal delivered as the
@@ -503,8 +509,10 @@ async def selftest() -> dict:
         # be refused, under the packet filter it must work for an in-scope
         # destination. Getting this wrong in either direction means callers
         # cannot interpret scanner output correctly.
+        # "python3" is the POSIX convention; Windows installs ship "python" only.
+        python_bin = "python" if sys.platform == "win32" else "python3"
         probe = await lane.run_shell(
-            "python3 -c \"import socket,sys;"
+            f'{python_bin} -c "import socket,sys;'
             "s=socket.socket();s.settimeout(4);"
             f"s.connect(('127.0.0.1',{port}));print('DIRECT_OK')\" 2>&1 "
             "|| echo DIRECT_BLOCKED", timeout=25)
