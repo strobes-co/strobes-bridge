@@ -38,12 +38,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import secrets
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -568,10 +572,25 @@ def run_as_sandbox(command: str, env: dict, cwd: Optional[str],
         # The task runs as a different, lower-privileged account than whatever
         # created work_dir (this process); it needs its own write access to
         # read the script and create the output files.
+        #
+        # The caller's own account is granted here too, and not just relied
+        # on implicitly: the output files are created by the sandbox
+        # account's own redirect (PowerShell's own "1>"/"2>", not this
+        # process), so it — not the caller — ends up as their owner, and
+        # "OWNER RIGHTS" inherited onto them resolves to that owner, not to
+        # whoever is about to try to read them back. An admin caller is
+        # unaffected (BUILTIN\Administrators already covers it), but a
+        # non-admin one has nothing else granting it access at all.
         _powershell(
             f'icacls "{work_dir}" /grant "*{sid}:(OI)(CI)F" | Out-Null',
             check=False,
         )
+        caller = os.environ.get("USERNAME", "")
+        if caller:
+            _powershell(
+                f'icacls "{work_dir}" /grant "{caller}:(OI)(CI)F" | Out-Null',
+                check=False,
+            )
 
         # Windows keeps a few hidden, non-identifier environment entries (the
         # per-drive current directory, e.g. "=C:") that ``$env:NAME`` syntax
@@ -634,11 +653,25 @@ if ($r -eq {_TASK_RUNNING}) {{
             # both detects that BOM and falls back to native order if a file
             # happens to be empty (no BOM at all), so it is always the right
             # choice for a file this script's own redirection produced.
-            try:
-                with open(path, "r", encoding="utf-16", errors="replace") as fh:
-                    return fh.read()
-            except OSError:
-                return ""
+            #
+            # A brief retry, not a single attempt: Task Scheduler reports the
+            # task done as soon as its action process (powershell.exe) exits,
+            # but that is a different kernel object than the NTFS directory
+            # entry for a file it just created, and nothing guarantees the
+            # second is visible to another process the instant the first is —
+            # confirmed in practice by a real-time antivirus scan holding a
+            # brief lock on a just-written file. Without this a genuinely
+            # successful command intermittently reports empty output.
+            last_error = None
+            for attempt in range(10):
+                try:
+                    with open(path, "r", encoding="utf-16", errors="replace") as fh:
+                        return fh.read()
+                except OSError as e:
+                    last_error = e
+                    time.sleep(0.1 * (attempt + 1))
+            logger.warning("could not read %s after retrying: %s", path, last_error)
+            return ""
 
         return result_code, _read(out_path), _read(err_path)
     finally:
