@@ -308,15 +308,21 @@ def _grant_logon_rights(sid: str) -> None:
     ``secedit`` round-trips the *entire* user-rights policy through a text
     file, which sounds heavier than it is: this only ever adds ``sid`` to the
     handful of lines it targets, so it cannot drop a right some other account
-    already holds, and running it again when the SID is already present is a
-    no-op. There is no narrower supported API for this — ``LsaAddAccountRights``
-    is the alternative, but it demands hand-rolled ``LSA_UNICODE_STRING``/SID
-    marshaling for a one-time setup step, which is worse to get subtly wrong
-    than one securely-generated policy file.
+    already holds, and running it again when the account already holds a
+    right is a no-op. There is no narrower supported API for this —
+    ``LsaAddAccountRights`` is the alternative, but it demands hand-rolled
+    ``LSA_UNICODE_STRING``/SID marshaling for a one-time setup step, which is
+    worse to get subtly wrong than one securely-generated policy file.
+
+    A currently-existing account is rendered by *name*, not by the SID this
+    function is called with — ``secedit`` resolves it on export — so the
+    already-granted check matches either form; matching the SID alone would
+    treat an already-granted right as missing and add it again on every call.
     """
     script = f"""
 $ErrorActionPreference = 'Stop'
 $sid = '{sid}'
+$account = '{_ps_single_quote(ACCOUNT)}'
 $rights = @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})
 $cfgPath = Join-Path $env:TEMP ("strobes-secpol-{{0}}.cfg" -f ([guid]::NewGuid()))
 try {{
@@ -327,7 +333,9 @@ try {{
         $lines = $lines | ForEach-Object {{
             if ($_ -match "^\\s*$right\\s*=") {{
                 $found = $true
-                if ($_ -notmatch [regex]::Escape($sid)) {{ "$_,*$sid" }} else {{ $_ }}
+                $hasSid = $_ -match [regex]::Escape($sid)
+                $hasName = $_ -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+                if (-not $hasSid -and -not $hasName) {{ "$_,*$sid" }} else {{ $_ }}
             }} else {{ $_ }}
         }}
         if (-not $found) {{
@@ -375,8 +383,13 @@ def _has_logon_rights(sid: str) -> bool:
     Local security policy is machine-wide state outside this module's control
     — a GPO refresh or another tool can reset it — so :func:`ready` checks the
     live policy rather than trusting that :func:`setup` once granted it.
+
+    A currently-existing account is rendered by *name*, not by ``sid`` —
+    ``secedit`` resolves it on export — so this matches either form; matching
+    the SID alone would report an already-granted right as missing.
     """
     script = f"""
+$account = '{_ps_single_quote(ACCOUNT)}'
 $cfgPath = Join-Path $env:TEMP ("strobes-secpol-check-{{0}}.cfg" -f ([guid]::NewGuid()))
 try {{
     secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
@@ -384,7 +397,9 @@ try {{
     $missing = @()
     foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
         $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
-        if (-not $line -or $line -notmatch [regex]::Escape('{sid}')) {{ $missing += $right }}
+        $hasSid = $line -match [regex]::Escape('{sid}')
+        $hasName = $line -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+        if (-not $line -or (-not $hasSid -and -not $hasName)) {{ $missing += $right }}
     }}
     if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
 }} finally {{
@@ -448,6 +463,21 @@ _TASK_NOT_YET_RUN = 267011  # decimal form of the same code, seen in the wild
 def _ps_single_quote(value: str) -> str:
     """Escape ``value`` for embedding in a PowerShell single-quoted string."""
     return value.replace("'", "''")
+
+
+def grant_read_access(path: str, sid: str) -> None:
+    """Grant ``sid`` read access to a file the bridge's own account wrote.
+
+    The Windows equivalent of handing a file's *ownership* to the l3 lane's
+    uid: the sandbox account is a different Windows identity too, so a file
+    the bridge writes for a sandboxed command to read (an interpreter source
+    file, an input fixture) is otherwise unreadable to it. Read-only and
+    scoped to this one file, not the containing directory, so it grants
+    nothing beyond what the caller asked to share.
+    """
+    if not IS_WINDOWS:
+        return
+    _powershell(f'icacls "{path}" /grant "*{sid}:(R)" | Out-Null', check=False)
 
 
 def run_as_sandbox(command: str, env: dict, cwd: Optional[str],
@@ -557,8 +587,13 @@ if ($r -eq {_TASK_RUNNING}) {{
             )
 
         def _read(path):
+            # Windows PowerShell's ">" file redirection writes UTF-16LE with a
+            # BOM regardless of console/system codepage; the "utf-16" codec
+            # both detects that BOM and falls back to native order if a file
+            # happens to be empty (no BOM at all), so it is always the right
+            # choice for a file this script's own redirection produced.
             try:
-                with open(path, "r", errors="replace") as fh:
+                with open(path, "r", encoding="utf-16", errors="replace") as fh:
                     return fh.read()
             except OSError:
                 return ""

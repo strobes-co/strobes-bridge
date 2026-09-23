@@ -364,13 +364,14 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
 def adopt_path(path: str) -> None:
     """Make ``path`` usable by the identity commands run as.
 
-    In the packet-filter lane commands run as a separate account, so anything
-    the *bridge* writes for a command to read — an interpreter source file, an
-    input fixture — is owned by the wrong user. Ownership is handed over
-    explicitly rather than by loosening the mode, so the file never becomes
-    world-readable just to cross that boundary.
+    In the packet-filter lane, and on Windows, commands run as a separate
+    account, so anything the *bridge* writes for a command to read — an
+    interpreter source file, an input fixture — is owned by the wrong user.
+    Access is handed over explicitly rather than by loosening the mode, so the
+    file never becomes world-readable just to cross that boundary.
 
-    A no-op in the proxy lane, where the command runs as the bridge's own user.
+    A no-op on macOS/Linux's proxy lane (Seatbelt, bubblewrap), where the
+    command runs as the bridge's own user and already has access.
     """
     # Resolved without needing the lane to be running: the file is written
     # before the first command starts it.
@@ -380,6 +381,12 @@ def adopt_path(path: str) -> None:
         # The account is created here if the lane has not started yet — knowing
         # the identity to hand the file to is the same thing as having one.
         uid = l3lane.account_uid() or l3lane.ensure_account()
+    elif procsandbox.detect_backend() == procsandbox.WINDOWS:
+        from strobes_shell_agent import winsandbox
+        state = winsandbox.load_state()
+        if state:
+            winsandbox.grant_read_access(path, state["sid"])
+        return
     else:
         return
     if uid is None:
@@ -509,12 +516,23 @@ async def selftest() -> dict:
         # be refused, under the packet filter it must work for an in-scope
         # destination. Getting this wrong in either direction means callers
         # cannot interpret scanner output correctly.
+        #
+        # Deliberately probing an *external* address rather than the loopback
+        # origin: Windows Firewall does not filter loopback traffic at all (a
+        # documented, unfixable-at-this-layer limitation of the WFP backend —
+        # see winsandbox.block_rules), so a loopback probe would misreport
+        # every Windows host as failing this check regardless of whether
+        # egress is actually confined. An out-of-scope external address is the
+        # destination that actually matters for "can a proxy-blind tool escape
+        # confinement", and macOS/Seatbelt and Linux/bubblewrap both refuse it
+        # exactly as they would refuse the loopback origin, so this is no less
+        # strict a check on those backends.
         # "python3" is the POSIX convention; Windows installs ship "python" only.
         python_bin = "python" if sys.platform == "win32" else "python3"
         probe = await lane.run_shell(
             f'{python_bin} -c "import socket,sys;'
             "s=socket.socket();s.settimeout(4);"
-            f"s.connect(('127.0.0.1',{port}));print('DIRECT_OK')\" 2>&1 "
+            f"s.connect(('{blackhole}',443));print('DIRECT_OK')\" 2>&1 "
             "|| echo DIRECT_BLOCKED", timeout=25)
         direct_ok = "DIRECT_OK" in (probe.get("stdout") or "")
         claimed = capabilities(lane.mode)["raw_sockets"]
