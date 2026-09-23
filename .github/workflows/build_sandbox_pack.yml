@@ -443,7 +443,17 @@ jobs:
     runs-on: ubuntu-latest
     # Publish whatever packs built. !cancelled() lets a slow/failed leg (e.g. the scarce
     # Intel-mac runner) not sink the release; re-running that job later re-publishes it.
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    #
+    # Also publishes on a skills release. Until now this was tag-only, so a
+    # skills-updated dispatch built correct packs and then threw them away as
+    # workflow artifacts -- which have no stable URL a daemon can fetch. The
+    # effect was that a skills release could never reach a deployed bridge: it
+    # rebuilt packs nobody could download. Those runs publish to the rolling
+    # `pack-latest` release instead of a tag, because a skills release is not
+    # a bridge release and must not invent a version number for the agent.
+    if: >-
+      ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/')
+          || github.event_name == 'repository_dispatch') }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -454,14 +464,47 @@ jobs:
           cd dist
           for f in *.tar.gz; do sha256sum "$f" > "$f.sha256"; done
           ls -la
+
+      - name: Resolve the release tag and the pack version
+        id: rel
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "tag=pack-latest" >> "$GITHUB_OUTPUT"
+            echo "rolling=true"    >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "rolling=false"   >> "$GITHUB_OUTPUT"
+          fi
+
+          # The version the daemon compares against is the one stamped INSIDE
+          # the pack, not the tag: on a dispatch run STROBES_PACK_VERSION is
+          # empty and build_pack.py falls back to a deterministic hash of the
+          # pack's contents, so it changes exactly when the skills or SDKs do.
+          # Read it back out of a built pack rather than recomputing it here,
+          # so the advertised version cannot drift from the shipped one.
+          mkdir -p _v && tar -xzf "$(ls dist/strobes-sandbox-pack-linux-x86_64.tar.gz)" -C _v
+          VERSION=$(python3 -c "import glob,json;print(json.load(open(glob.glob('_v/*/pack.manifest.json')[0]))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pack version: $VERSION"
+
+          # Published as a plain asset so the backend can read it with one
+          # unauthenticated GET. Deliberately NOT the GitHub API: that is 60
+          # requests/hour unauthenticated, and every bridge connect would
+          # spend one.
+          printf '%s\n' "$VERSION" > dist/pack.version
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          # The rolling release is a prerelease so it never becomes
+          # `releases/latest` and cannot be mistaken for an agent release.
+          prerelease: ${{ steps.rel.outputs.rolling }}
           # On a packs-only `pack-v*` tag this job OWNS the release, so title it.
           # On an agent `v*` tag release.yml owns the title/notes — leave `name`
           # empty (the action keeps the existing release's name, i.e. the tag) and
           # only APPEND the pack section so we augment that release instead of
           # renaming or clobbering it. Files are added either way.
-          name: ${{ startsWith(github.ref, 'refs/tags/pack-v') && format('Sandbox packs {0}', github.ref_name) || '' }}
+          name: ${{ steps.rel.outputs.rolling == 'true' && 'Sandbox packs (rolling)' || (startsWith(github.ref, 'refs/tags/pack-v') && format('Sandbox packs {0}', github.ref_name) || '') }}
           append_body: true
           body: |
             ### Bridge sandbox packs
@@ -470,8 +513,11 @@ jobs:
             subfinder, dnsx; internal-ad packs add kerbrute).
 
             The bridge auto-downloads/updates the pack for its OS/arch via
-            `STROBES_PACK_URL=https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}`.
+            `STROBES_PACK_URL=https://github.com/${{ github.repository }}/releases/download/${{ steps.rel.outputs.tag }}`,
+            or automatically when the backend advertises `required_pack_version`
+            (pack version in this release: `${{ steps.rel.outputs.version }}`).
             Each `*.tar.gz` has a matching `*.sha256` for integrity verification.
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/pack.version
