@@ -144,8 +144,21 @@ def block_rules(sid: str) -> list:
 # ---------------------------------------------------------------------------
 
 def _state_path() -> Path:
-    from strobes_shell_agent.config import CONFIG_DIR
-    return Path(CONFIG_DIR) / _STATE_FILE
+    """Where the sandbox account's credentials live.
+
+    Deliberately machine-wide (``%ProgramData%``), not the per-user config dir
+    ``setup()`` would otherwise inherit from :mod:`config`. ``setup()`` requires
+    elevation and is typically run once by an administrator, but ``connect``
+    is designed to run as whatever ordinary user is logged into the host (the
+    installer needs no elevation and installs per-user, under
+    ``%LOCALAPPDATA%``) — a per-user path would mean that user's own
+    ``connect`` can never find the state a *different* admin account set up.
+    The password is still DPAPI-protected at machine scope, and the file's own
+    ACL (:func:`_save_state`) keeps it read-only for anyone but the admin who
+    wrote it.
+    """
+    root = os.environ.get("ProgramData", r"C:\ProgramData")
+    return Path(root) / "StrobesShellAgent" / _STATE_FILE
 
 
 def _protect(secret: str) -> str:
@@ -194,20 +207,32 @@ def _unprotect(blob_b64: str) -> str:
 def _save_state(sid: str, password: str, port_range: tuple) -> None:
     path = _state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Explicit rather than relying on inheriting %ProgramData%'s own ACL: any
+    # local user must be able to traverse into this directory to reach the
+    # state file, on whatever this host's default happens to be.
+    _powershell(f'icacls "{path.parent}" /grant "*S-1-5-32-545:(OI)(CI)RX" | Out-Null',
+                check=False)
     path.write_text(json.dumps({
         "account": ACCOUNT,
         "sid": sid,
         "password": _protect(password),
         "port_range": list(port_range),
     }))
-    # Readable only by the installing administrator and SYSTEM.
+    # Writable only by admins and SYSTEM (setup/teardown), but readable by any
+    # local user: connect() runs as whatever ordinary user is logged in and
+    # must be able to load this to find the sandbox account at all. That's
+    # safe because run_as_sandbox's read is exactly the access it needs
+    # anyway (it operates as this account by design), and the password inside
+    # is still DPAPI-protected at machine scope, not stored in clear.
     _powershell(
         f"$p='{path}'; $a=Get-Acl $p; $a.SetAccessRuleProtection($true,$false); "
         "$a.Access | ForEach-Object { $a.RemoveAccessRule($_) | Out-Null }; "
         "$a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
         "'BUILTIN\\Administrators','FullControl','Allow'))); "
         "$a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
-        "'NT AUTHORITY\\SYSTEM','FullControl','Allow'))); Set-Acl $p $a",
+        "'NT AUTHORITY\\SYSTEM','FullControl','Allow'))); "
+        "$a.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule("
+        "'BUILTIN\\Users','Read','Allow'))); Set-Acl $p $a",
         check=False,
     )
 
@@ -377,8 +402,8 @@ def _account_sid() -> str:
     return sid
 
 
-def _has_logon_rights(sid: str) -> bool:
-    """Whether ``sid`` currently holds every right in :data:`LOGON_RIGHTS`.
+def _has_logon_rights(sid: str) -> Optional[bool]:
+    """Whether ``sid`` currently holds every right in :data:`LOGON_RIGHTS``.
 
     Local security policy is machine-wide state outside this module's control
     — a GPO refresh or another tool can reset it — so :func:`ready` checks the
@@ -387,33 +412,50 @@ def _has_logon_rights(sid: str) -> bool:
     A currently-existing account is rendered by *name*, not by ``sid`` —
     ``secedit`` resolves it on export — so this matches either form; matching
     the SID alone would report an already-granted right as missing.
+
+    Returns ``None``, not ``False``, when the check itself could not run —
+    ``secedit /export`` needs elevation, but ``connect`` (unlike ``setup``) is
+    designed to run as an ordinary user, and that user cannot be expected to
+    audit a policy it has no rights to even read. ``None`` means "can't tell",
+    which :func:`ready` treats as "assume setup already got this right" rather
+    than as a missing grant — the distinction that matters, since the two
+    would otherwise look identical from an unprivileged caller and only one
+    of them is actually a problem.
     """
     script = f"""
 $account = '{_ps_single_quote(ACCOUNT)}'
 $cfgPath = Join-Path $env:TEMP ("strobes-secpol-check-{{0}}.cfg" -f ([guid]::NewGuid()))
 try {{
     secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
-    $lines = Get-Content $cfgPath
-    $missing = @()
-    foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
-        $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
-        $hasSid = $line -match [regex]::Escape('{sid}')
-        $hasName = $line -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
-        if (-not $line -or (-not $hasSid -and -not $hasName)) {{ $missing += $right }}
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $cfgPath)) {{
+        'UNKNOWN'
+    }} else {{
+        $lines = Get-Content $cfgPath
+        $missing = @()
+        foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
+            $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
+            $hasSid = $line -match [regex]::Escape('{sid}')
+            $hasName = $line -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+            if (-not $line -or (-not $hasSid -and -not $hasName)) {{ $missing += $right }}
+        }}
+        if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
     }}
-    if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
 }} finally {{
     Remove-Item $cfgPath -ErrorAction SilentlyContinue
 }}
 """
     try:
-        return _powershell(script, check=False).strip() == "yes"
+        outcome = _powershell(script, check=False).strip()
     except WindowsSetupError:
-        return False
+        return None
+    if outcome == "UNKNOWN":
+        return None
+    return outcome == "yes"
 
 
 def ready() -> bool:
-    """True when the account, its logon rights, and the block rule are in place."""
+    """True when the account and the block rule are in place, and — where this
+    caller has enough privilege to tell — its logon rights too."""
     if not IS_WINDOWS:
         return False
     state = load_state()
@@ -422,7 +464,7 @@ def ready() -> bool:
     try:
         if not _account_exists():
             return False
-        if not _has_logon_rights(state["sid"]):
+        if _has_logon_rights(state["sid"]) is False:
             return False
         found = _powershell(
             f"if (Get-NetFirewallRule -DisplayName '{RULE_BLOCK}' "
