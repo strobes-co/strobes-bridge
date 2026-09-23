@@ -28,9 +28,10 @@ Backends:
   elevated setup (``sandbox-setup``); until that is done the host reports no
   backend rather than pretending to confine anything. See :mod:`winsandbox`.
 
-Coverage is honest about itself: macOS is exercised by the test suite, Linux and
-Windows are implemented but unproven, and ``sandbox-check`` runs a real
-out-of-scope connection so either one can prove or disprove itself in place.
+Coverage is honest about itself: macOS is exercised by the test suite, Linux is
+implemented but unproven, and Windows has been verified against a live host
+(see :mod:`winsandbox`). ``sandbox-check`` runs a real out-of-scope connection
+so any of them can prove or disprove itself in place.
 
 There is deliberately **no unsandboxed fallback**. If no backend is available
 the bridge refuses to execute rather than quietly running commands with

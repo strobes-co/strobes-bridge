@@ -217,9 +217,12 @@ def build_env(base: Optional[dict] = None) -> dict:
 
 def python_interpreter() -> str:
     """Interpreter to use for ``execute_code`` python: the pack's if present, else the
-    host's ``python3`` (pre-pack behaviour)."""
+    host's own interpreter (pre-pack behaviour). Windows installs ship "python", not
+    the POSIX-convention "python3"."""
     py = pack_python()
-    return str(py) if py else "python3"
+    if py:
+        return str(py)
+    return "python" if sys.platform == "win32" else "python3"
 
 
 def status() -> dict:

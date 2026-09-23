@@ -590,7 +590,8 @@ def get_env_info() -> dict:
     # Check for common tools, honouring the sandbox pack's bin/ dir if present.
     env_path = pack.build_env().get("PATH")
     tools = {}
-    for tool in ["python3", "node", "npm", "git", "docker", "nmap", "curl", "wget",
+    python_tool = "python" if sys.platform == "win32" else "python3"
+    for tool in [python_tool, "node", "npm", "git", "docker", "nmap", "curl", "wget",
                  "nuclei", "httpx", "subfinder", "ffuf", "gobuster"]:
         tools[tool] = shutil.which(tool, path=env_path) is not None
     info["tools"] = tools
