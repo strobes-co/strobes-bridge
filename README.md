@@ -1,4 +1,6 @@
-# Strobes Shell Agent
+<p align="center">
+  <img src="assets/banner.png" alt="Strobes Shell Agent" width="800"/>
+</p>
 
 A lightweight daemon that connects your machine to the [Strobes](https://strobes.co) platform, enabling AI agents to execute commands remotely — without SSH, firewall rules, or inbound ports.
 
