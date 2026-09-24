@@ -6,16 +6,6 @@ A lightweight daemon that connects your machine to the [Strobes](https://strobes
 
 Think of it as "Local Browser" but for shell access: the agent runs on your machine, connects **outbound** to Strobes via WebSocket, and the AI agent sends commands through that tunnel.
 
-```
-┌──────────────────────┐          WebSocket          ┌──────────────────────┐
-│   Strobes Platform   │◄──── outbound connection ───│  Your Machine        │
-│                      │                              │                      │
-│  AI Agent calls      │   ── shell_execute ───►      │  strobes-shell-agent │
-│  workspace_execute   │   ◄── stdout/stderr ──       │  (this daemon)       │
-│  _shell_command()    │                              │                      │
-└──────────────────────┘                              └──────────────────────┘
-```
-
 ## Why?
 
 | | SSH Shell | Shell Agent (Bridge) |
