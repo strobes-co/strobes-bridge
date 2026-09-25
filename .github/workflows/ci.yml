@@ -100,6 +100,25 @@ jobs:
         run: sudo -E env "PATH=$PATH" strobes-shell-agent sandbox-check
         shell: bash
 
+      # TEMPORARY diagnostic. `logon_rights: false` has survived two fixes
+      # (exit-code checking, UTF-16 encoding) and neither the exit code nor
+      # the readiness flags say why. Print what the policy database actually
+      # contains so the next fix is based on the file rather than on a guess.
+      - name: What does the policy actually say? (diagnostic)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $cfg = Join-Path $env:TEMP "diag.cfg"
+          secedit /export /cfg $cfg /areas USER_RIGHTS | Out-Null
+          Write-Host "exit=$LASTEXITCODE"
+          Write-Host "--- account ---"
+          Get-LocalUser -Name 'strobes-sandbox' | Format-List Name,SID | Out-String | Write-Host
+          Write-Host "--- logon-right lines as exported ---"
+          Get-Content $cfg | Where-Object { $_ -match 'LogonRight' } | ForEach-Object { Write-Host $_ }
+          Write-Host "--- file encoding (first bytes) ---"
+          $b = [System.IO.File]::ReadAllBytes($cfg)[0..3]
+          Write-Host ($b -join ' ')
+
       - name: Verify egress is enforced
         if: runner.os != 'Linux'
         run: strobes-shell-agent sandbox-check
