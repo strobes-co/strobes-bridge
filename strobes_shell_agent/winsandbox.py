@@ -385,7 +385,13 @@ try {{
             $lines = $lines[0..$idx] + "$right = *$sid" + $lines[($idx + 1)..($lines.Count - 1)]
         }}
     }}
-    Set-Content -Path $cfgPath -Value $lines
+    # UTF-16, explicitly. `secedit /export` writes a Unicode .inf, but
+    # Set-Content on Windows PowerShell 5.1 defaults to ANSI -- so the
+    # round-trip silently downgrades the encoding and `secedit /configure`
+    # then parses nothing, applies nothing, and STILL EXITS 0. That is the
+    # shape of this bug: setup reported success, $LASTEXITCODE was 0, and the
+    # rights were never granted.
+    Set-Content -Path $cfgPath -Value $lines -Encoding Unicode
     $out = secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS 2>&1
     if ($LASTEXITCODE -ne 0) {{ throw "secedit /configure failed ($LASTEXITCODE): $out" }}
 }} finally {{
