@@ -373,7 +373,7 @@ try {{
             if ($_ -match "^\\s*$right\\s*=") {{
                 $found = $true
                 $hasSid = $_ -match [regex]::Escape($sid)
-                $hasName = $_ -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+                $hasName = $_ -match "(?i)(^|[=,])\\s*([^,]*\\\\)?$([regex]::Escape($account))\\s*(,|$)"
                 if (-not $hasSid -and -not $hasName) {{ "$_,*$sid" }} else {{ $_ }}
             }} else {{ $_ }}
         }}
@@ -456,7 +456,7 @@ try {{
         foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
             $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
             $hasSid = $line -match [regex]::Escape('{sid}')
-            $hasName = $line -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+            $hasName = $line -match "(?i)(^|[=,])\\s*([^,]*\\\\)?$([regex]::Escape($account))\\s*(,|$)"
             if (-not $line -or (-not $hasSid -and -not $hasName)) {{ $missing += $right }}
         }}
         if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
