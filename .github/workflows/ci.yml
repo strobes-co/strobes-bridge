@@ -88,7 +88,20 @@ jobs:
         if: runner.os == 'Windows'
         run: strobes-shell-agent sandbox-setup
 
+      # Linux needs root for this, and not as a convenience: the preferred
+      # lane is packet-level nftables, and `l3lane.available()` probes for
+      # CAP_NET_ADMIN by listing the ruleset. Unprivileged, it falls back to
+      # the bubblewrap proxy lane -- which a runner cannot use either, because
+      # unprivileged user namespaces are not permitted. So an unsudoed check
+      # reports "backend: NONE" and fails, which is the honest answer to the
+      # wrong question. The l3 pytest step above already runs under sudo.
+      - name: Verify egress is enforced (Linux, via the privileged l3 lane)
+        if: runner.os == 'Linux'
+        run: sudo -E env "PATH=$PATH" strobes-shell-agent sandbox-check
+        shell: bash
+
       - name: Verify egress is enforced
+        if: runner.os != 'Linux'
         run: strobes-shell-agent sandbox-check
         shell: bash
 

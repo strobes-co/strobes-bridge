@@ -274,6 +274,7 @@ def setup(port_range: tuple) -> dict:
 
     if not _account_exists():
         _powershell(
+            'Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue; '
             f"$p = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
             f"New-LocalUser -Name '{ACCOUNT}' -Password $p "
             "-Description 'Strobes bridge sandboxed command execution' "
@@ -285,6 +286,7 @@ def setup(port_range: tuple) -> dict:
         password = _unprotect(existing["password"])
     else:
         _powershell(
+            'Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue; '
             f"$p = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
             f"Set-LocalUser -Name '{ACCOUNT}' -Password $p"
         )
