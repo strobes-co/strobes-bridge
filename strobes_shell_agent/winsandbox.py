@@ -357,7 +357,15 @@ $account = '{_ps_single_quote(ACCOUNT)}'
 $rights = @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})
 $cfgPath = Join-Path $env:TEMP ("strobes-secpol-{{0}}.cfg" -f ([guid]::NewGuid()))
 try {{
-    secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    # $ErrorActionPreference='Stop' governs CMDLETS, not native executables:
+    # secedit can fail and the script sails on. Both calls are therefore
+    # checked by hand, and their output is kept so the message says what
+    # secedit actually complained about. Silent failure here produced a setup
+    # that reported "Created account ... Installed firewall rule" while the
+    # logon rights were never granted, leaving `ready` false with nothing to
+    # explain why.
+    $out = secedit /export /cfg $cfgPath /areas USER_RIGHTS 2>&1
+    if ($LASTEXITCODE -ne 0) {{ throw "secedit /export failed ($LASTEXITCODE): $out" }}
     $lines = Get-Content $cfgPath
     foreach ($right in $rights) {{
         $found = $false
@@ -378,7 +386,8 @@ try {{
         }}
     }}
     Set-Content -Path $cfgPath -Value $lines
-    secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    $out = secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS 2>&1
+    if ($LASTEXITCODE -ne 0) {{ throw "secedit /configure failed ($LASTEXITCODE): $out" }}
 }} finally {{
     Remove-Item $cfgPath -ErrorAction SilentlyContinue
 }}
