@@ -282,6 +282,22 @@ def build_env(base: Optional[dict] = None) -> dict:
     """Return an environment dict with the pack prepended to PATH and any bundle-tool
     env vars (e.g. NMAPDIR, NUCLEI_CONFIG_DIR) applied. If no pack is present, returns a
     copy of ``base`` unchanged. Safe to call on every command."""
+    # The workspace directory, created here and not in _extra_env(), which
+    # returns early when there is no sandbox pack -- a packless host would
+    # then get no workspace at all. This belongs on a path that runs on every
+    # connect regardless of what is installed.
+    #
+    # On a cloud sandbox the S3 Files mount makes ~/.strobes/workspace exist
+    # before any agent code runs. Nothing does that here unless we do, and an
+    # agent that opens the path it was told to use and gets ENOENT reports
+    # the bridge as broken rather than the workspace as empty.
+    try:
+        from strobes_shell_agent.workspace import workspace_ensure
+
+        workspace_ensure()
+    except Exception as e:  # noqa: BLE001 -- never block env setup on this
+        log.warning(f"could not create the workspace directory: {e}")
+
     env = dict(os.environ if base is None else base)
     prefix = _path_prefix()
     if prefix:

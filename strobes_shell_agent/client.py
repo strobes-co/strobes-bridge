@@ -17,6 +17,7 @@ from strobes_shell_agent import sandbox
 from strobes_shell_agent import selfupdate
 from strobes_shell_agent import sessions
 from strobes_shell_agent import responder
+from strobes_shell_agent import workspace
 from strobes_shell_agent import __version__ as AGENT_VERSION
 from strobes_shell_agent.executor import (
     execute_shell_command,
@@ -499,6 +500,30 @@ class ShellBridgeClient:
                 params.get("path", ""),
                 params.get("url", ""),
                 params.get("content_type", "application/octet-stream"),
+                params.get("timeout", 300),
+            )
+
+        # --- Workspace: the ~/.strobes/workspace a bridge cannot mount -------
+        elif command == "workspace_ensure":
+            return await asyncio.to_thread(workspace.workspace_ensure)
+
+        elif command == "workspace_pull":
+            return await asyncio.to_thread(
+                workspace.workspace_pull,
+                params.get("files") or [],
+                params.get("timeout", 300),
+            )
+
+        elif command == "workspace_scan":
+            return await asyncio.to_thread(
+                workspace.workspace_scan,
+                params.get("include_sha256", True),
+            )
+
+        elif command == "workspace_push":
+            return await asyncio.to_thread(
+                workspace.workspace_push,
+                params.get("files") or [],
                 params.get("timeout", 300),
             )
 
