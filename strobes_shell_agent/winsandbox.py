@@ -459,25 +459,51 @@ try {{
     return outcome == "yes"
 
 
-def ready() -> bool:
-    """True when the account and the block rule are in place, and — where this
-    caller has enough privilege to tell — its logon rights too."""
+def readiness() -> dict:
+    """Each condition :func:`ready` requires, reported separately.
+
+    ``ready: false`` on its own is undiagnosable -- it collapses "no state
+    file", "account missing", "logon rights revoked" and "firewall rule gone"
+    into one bit, and the four have completely different fixes. Anyone hitting
+    it then has to read this source to find out which applies, and on a host
+    they may only reach through a support channel.
+
+    Every value is ``True``, ``False``, or ``None`` for "could not tell" --
+    the logon-rights probe needs elevation that ``connect`` deliberately does
+    not have.
+    """
+    out = {"platform": IS_WINDOWS or None, "state_file": None,
+           "account": None, "logon_rights": None, "firewall_rule": None}
     if not IS_WINDOWS:
-        return False
+        out["platform"] = False
+        return out
     state = load_state()
+    out["state_file"] = bool(state)
     if not state:
-        return False
+        return out
     try:
-        if not _account_exists():
-            return False
-        if _has_logon_rights(state["sid"]) is False:
-            return False
+        out["account"] = _account_exists()
+        if not out["account"]:
+            return out
+        # None means "could not check", which is not a missing grant -- see
+        # _has_logon_rights.
+        out["logon_rights"] = _has_logon_rights(state["sid"])
         found = _powershell(
             f"if (Get-NetFirewallRule -DisplayName '{RULE_BLOCK}' "
             "-ErrorAction SilentlyContinue) {'1'} else {'0'}", check=False)
-        return found.strip() == "1"
-    except WindowsSetupError:
-        return False
+        out["firewall_rule"] = found.strip() == "1"
+    except WindowsSetupError as e:
+        out["error"] = str(e)
+    return out
+
+
+def ready() -> bool:
+    """True when the account and the block rule are in place, and — where this
+    caller has enough privilege to tell — its logon rights too."""
+    r = readiness()
+    return bool(r.get("platform") and r.get("state_file") and r.get("account")
+                and r.get("logon_rights") is not False
+                and r.get("firewall_rule"))
 
 
 def status() -> dict:
@@ -486,6 +512,8 @@ def status() -> dict:
         "platform_supported": IS_WINDOWS,
         "configured": bool(state),
         "ready": ready(),
+        # Which condition failed, not merely that one did.
+        "readiness": readiness(),
         "account": ACCOUNT,
         "sid": (state or {}).get("sid"),
         "port_range": (state or {}).get("port_range"),
