@@ -40,8 +40,10 @@ unrestricted egress while reporting a scope it is not applying.
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from typing import Optional
@@ -59,21 +61,74 @@ class SandboxUnavailable(RuntimeError):
     """No usable sandbox backend on this host — execution must not proceed."""
 
 
+#: How long a capability probe may take. It runs `true` and nothing else, so
+#: anything approaching this means the sandbox is not going to be usable.
+_PROBE_TIMEOUT = 10
+
+
+@functools.lru_cache(maxsize=8)
+def _probe(argv: tuple) -> bool:
+    """Run a trivial command under the backend and report whether it worked.
+
+    The binary being installed is not the same question as the sandbox being
+    usable, and on Linux the two come apart constantly: bubblewrap needs
+    unprivileged user namespaces, which CI runners, hardened kernels and many
+    container runtimes refuse. `--unshare-net` then fails bringing up loopback
+    with `RTM_NEWADDR: Operation not permitted`.
+
+    Before this, such a host passed detection and failed every single command
+    with that raw bwrap message -- which reads as a broken command, not as a
+    host that cannot sandbox. Probing once turns it into the honest answer the
+    caller already knows how to handle: no backend, refuse to execute, say so.
+
+    Memoised on the argv rather than on :func:`detect_backend`, because the
+    subprocess is the only expensive part. Caching the whole function would
+    also freeze the Windows branch, which must stay live: `winsandbox.ready()`
+    flips from false to true the moment `sandbox-setup` runs, and a host should
+    not have to restart the daemon to notice it just gained a sandbox.
+    """
+    try:
+        return subprocess.run(
+            list(argv), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT,
+        ).returncode == 0
+    except Exception:
+        # Missing binary, timeout, permission error -- all the same answer.
+        return False
+
+
 def detect_backend() -> Optional[str]:
-    """Which backend this host can use, or ``None``.
+    """Which backend this host can *actually use*, or ``None``.
+
+    Every branch proves itself rather than inferring from a file's presence:
+    a backend that cannot run a no-op command is not a backend. The probe
+    itself is memoised (see :func:`_probe`); this function is not, so a host
+    that gains capability is noticed without a restart.
 
     Windows is conditional on one-time elevated setup (a dedicated account plus
     its egress filter), so an un-provisioned Windows host reports no backend
     rather than pretending to confine anything.
     """
     if sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"):
-        return SEATBELT
+        return SEATBELT if _probe(
+            ("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)",
+             "/usr/bin/true")) else None
     if sys.platform.startswith("linux") and shutil.which("bwrap"):
-        return BUBBLEWRAP
+        # The same flags the real sandbox uses, minus the socket bind: it is
+        # --unshare-net that fails on a host without userns permission, so a
+        # probe that omitted it would pass where execution goes on to fail.
+        return BUBBLEWRAP if _probe(
+            ("bwrap", "--dev-bind", "/", "/", "--unshare-net",
+             "--die-with-parent", "true")) else None
     if sys.platform == "win32":
         from strobes_shell_agent import winsandbox
         return WINDOWS if winsandbox.ready() else None
     return None
+
+
+def reset() -> None:
+    """Forget cached probe results — after gaining capability, or in tests."""
+    _probe.cache_clear()
 
 
 def available() -> bool:
