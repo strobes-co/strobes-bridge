@@ -274,7 +274,8 @@ def setup(port_range: tuple) -> dict:
 
     if not _account_exists():
         _powershell(
-            f"$p = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
+            f"$p = New-Object System.Security.SecureString; "
+            f"'{password}'.ToCharArray() | ForEach-Object {{ $p.AppendChar($_) }}; "
             f"New-LocalUser -Name '{ACCOUNT}' -Password $p "
             "-Description 'Strobes bridge sandboxed command execution' "
             "-PasswordNeverExpires -UserMayNotChangePassword | Out-Null"
@@ -285,7 +286,8 @@ def setup(port_range: tuple) -> dict:
         password = _unprotect(existing["password"])
     else:
         _powershell(
-            f"$p = ConvertTo-SecureString '{password}' -AsPlainText -Force; "
+            f"$p = New-Object System.Security.SecureString; "
+            f"'{password}'.ToCharArray() | ForEach-Object {{ $p.AppendChar($_) }}; "
             f"Set-LocalUser -Name '{ACCOUNT}' -Password $p"
         )
 
@@ -355,7 +357,15 @@ $account = '{_ps_single_quote(ACCOUNT)}'
 $rights = @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})
 $cfgPath = Join-Path $env:TEMP ("strobes-secpol-{{0}}.cfg" -f ([guid]::NewGuid()))
 try {{
-    secedit /export /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    # $ErrorActionPreference='Stop' governs CMDLETS, not native executables:
+    # secedit can fail and the script sails on. Both calls are therefore
+    # checked by hand, and their output is kept so the message says what
+    # secedit actually complained about. Silent failure here produced a setup
+    # that reported "Created account ... Installed firewall rule" while the
+    # logon rights were never granted, leaving `ready` false with nothing to
+    # explain why.
+    $out = secedit /export /cfg $cfgPath /areas USER_RIGHTS 2>&1
+    if ($LASTEXITCODE -ne 0) {{ throw "secedit /export failed ($LASTEXITCODE): $out" }}
     $lines = Get-Content $cfgPath
     foreach ($right in $rights) {{
         $found = $false
@@ -363,7 +373,7 @@ try {{
             if ($_ -match "^\\s*$right\\s*=") {{
                 $found = $true
                 $hasSid = $_ -match [regex]::Escape($sid)
-                $hasName = $_ -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+                $hasName = $_ -match "(?i)(^|[=,])\\s*([^,]*\\\\)?$([regex]::Escape($account))\\s*(,|$)"
                 if (-not $hasSid -and -not $hasName) {{ "$_,*$sid" }} else {{ $_ }}
             }} else {{ $_ }}
         }}
@@ -375,8 +385,15 @@ try {{
             $lines = $lines[0..$idx] + "$right = *$sid" + $lines[($idx + 1)..($lines.Count - 1)]
         }}
     }}
-    Set-Content -Path $cfgPath -Value $lines
-    secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS | Out-Null
+    # UTF-16, explicitly. `secedit /export` writes a Unicode .inf, but
+    # Set-Content on Windows PowerShell 5.1 defaults to ANSI -- so the
+    # round-trip silently downgrades the encoding and `secedit /configure`
+    # then parses nothing, applies nothing, and STILL EXITS 0. That is the
+    # shape of this bug: setup reported success, $LASTEXITCODE was 0, and the
+    # rights were never granted.
+    Set-Content -Path $cfgPath -Value $lines -Encoding Unicode
+    $out = secedit /configure /db "$env:windir\\security\\local.sdb" /cfg $cfgPath /areas USER_RIGHTS 2>&1
+    if ($LASTEXITCODE -ne 0) {{ throw "secedit /configure failed ($LASTEXITCODE): $out" }}
 }} finally {{
     Remove-Item $cfgPath -ErrorAction SilentlyContinue
 }}
@@ -439,7 +456,7 @@ try {{
         foreach ($right in @({", ".join(f"'{r}'" for r in LOGON_RIGHTS)})) {{
             $line = $lines | Where-Object {{ $_ -match "^\\s*$right\\s*=" }}
             $hasSid = $line -match [regex]::Escape('{sid}')
-            $hasName = $line -match "(?i)(^|,)\\s*$([regex]::Escape($account))\\s*(,|$)"
+            $hasName = $line -match "(?i)(^|[=,])\\s*([^,]*\\\\)?$([regex]::Escape($account))\\s*(,|$)"
             if (-not $line -or (-not $hasSid -and -not $hasName)) {{ $missing += $right }}
         }}
         if ($missing.Count -eq 0) {{ 'yes' }} else {{ 'no' }}
@@ -457,25 +474,51 @@ try {{
     return outcome == "yes"
 
 
-def ready() -> bool:
-    """True when the account and the block rule are in place, and — where this
-    caller has enough privilege to tell — its logon rights too."""
+def readiness() -> dict:
+    """Each condition :func:`ready` requires, reported separately.
+
+    ``ready: false`` on its own is undiagnosable -- it collapses "no state
+    file", "account missing", "logon rights revoked" and "firewall rule gone"
+    into one bit, and the four have completely different fixes. Anyone hitting
+    it then has to read this source to find out which applies, and on a host
+    they may only reach through a support channel.
+
+    Every value is ``True``, ``False``, or ``None`` for "could not tell" --
+    the logon-rights probe needs elevation that ``connect`` deliberately does
+    not have.
+    """
+    out = {"platform": IS_WINDOWS or None, "state_file": None,
+           "account": None, "logon_rights": None, "firewall_rule": None}
     if not IS_WINDOWS:
-        return False
+        out["platform"] = False
+        return out
     state = load_state()
+    out["state_file"] = bool(state)
     if not state:
-        return False
+        return out
     try:
-        if not _account_exists():
-            return False
-        if _has_logon_rights(state["sid"]) is False:
-            return False
+        out["account"] = _account_exists()
+        if not out["account"]:
+            return out
+        # None means "could not check", which is not a missing grant -- see
+        # _has_logon_rights.
+        out["logon_rights"] = _has_logon_rights(state["sid"])
         found = _powershell(
             f"if (Get-NetFirewallRule -DisplayName '{RULE_BLOCK}' "
             "-ErrorAction SilentlyContinue) {'1'} else {'0'}", check=False)
-        return found.strip() == "1"
-    except WindowsSetupError:
-        return False
+        out["firewall_rule"] = found.strip() == "1"
+    except WindowsSetupError as e:
+        out["error"] = str(e)
+    return out
+
+
+def ready() -> bool:
+    """True when the account and the block rule are in place, and — where this
+    caller has enough privilege to tell — its logon rights too."""
+    r = readiness()
+    return bool(r.get("platform") and r.get("state_file") and r.get("account")
+                and r.get("logon_rights") is not False
+                and r.get("firewall_rule"))
 
 
 def status() -> dict:
@@ -484,6 +527,8 @@ def status() -> dict:
         "platform_supported": IS_WINDOWS,
         "configured": bool(state),
         "ready": ready(),
+        # Which condition failed, not merely that one did.
+        "readiness": readiness(),
         "account": ACCOUNT,
         "sid": (state or {}).get("sid"),
         "port_range": (state or {}).get("port_range"),

@@ -529,10 +529,31 @@ async def selftest() -> dict:
         # strict a check on those backends.
         # "python3" is the POSIX convention; Windows installs ship "python" only.
         python_bin = "python" if sys.platform == "win32" else "python3"
+
+        # WHICH destination proves the claim depends on the lane, because the
+        # claim is about the socket layer while the policy is about addresses.
+        #
+        # Under the packet filter, `raw_sockets: True` means a tool may use
+        # ordinary sockets -- it does NOT mean it may reach anywhere. An
+        # out-of-scope address is blocked by design, so probing one and
+        # demanding success asks the lane to break its own policy to prove a
+        # capability. That is what this used to do, and it failed every
+        # correctly-configured Linux host: mode=l3, "LANE MISREPORTS ITSELF".
+        # The discriminating probe there is an IN-SCOPE address, which a raw
+        # socket must reach and which under a proxy lane it could not.
+        #
+        # Under the proxy lane the in-scope address is the loopback origin, and
+        # Windows Filtering Platform does not filter loopback at all (see
+        # winsandbox.block_rules) -- so an in-scope probe would report every
+        # Windows host as raw-socket-capable. There the out-of-scope address is
+        # the honest discriminator, and it is also the one that matters: it
+        # answers "can a proxy-blind tool escape confinement".
+        cap_host, cap_port = (("127.0.0.1", port) if lane.mode == "l3"
+                              else (blackhole, 443))
         probe = await lane.run_shell(
             f'{python_bin} -c "import socket,sys;'
             "s=socket.socket();s.settimeout(4);"
-            f"s.connect(('{blackhole}',443));print('DIRECT_OK')\" 2>&1 "
+            f"s.connect(('{cap_host}',{cap_port}));print('DIRECT_OK')\" 2>&1 "
             "|| echo DIRECT_BLOCKED", timeout=25)
         direct_ok = "DIRECT_OK" in (probe.get("stdout") or "")
         claimed = capabilities(lane.mode)["raw_sockets"]
