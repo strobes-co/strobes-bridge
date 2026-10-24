@@ -70,8 +70,15 @@ def _sh(cmd):
 def test_sandboxed_command_reads_writes_and_pushes_the_workspace(store, tmp_path):
     from strobes_shell_agent import workspace
 
+    from strobes_shell_agent import executor
+
+    probe = asyncio.run(executor.execute_code(
+        "python", "import urllib.request,sys;print(sys.executable);"
+                  f"print(urllib.request.urlopen({store + '/docs/scope.md'!r}, timeout=20).read())",
+        timeout=120))
+    print("lane python probe:", probe)
     r = workspace.workspace_pull([{"path": "docs/scope.md", "url": store + "/docs/scope.md"}])
-    assert r["pulled"] == 1, r
+    assert r["pulled"] == 1, (r["failed"], probe)
     root = str(workspace.workspace_root())
 
     out = _sh(f'type "{os.path.join(root, "docs", "scope.md")}"')
