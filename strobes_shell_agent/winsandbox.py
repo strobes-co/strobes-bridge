@@ -571,6 +571,18 @@ def grant_read_access(path: str, sid: str) -> None:
     _powershell(f'icacls "{path}" /grant "*{sid}:(R)" | Out-Null', check=False)
 
 
+def grant_modify_access(path: str, sid: str) -> None:
+    """Let ``sid`` create and change files under the directory ``path``.
+
+    For the workspace only: commands run as the sandbox account and must be
+    able to save their output there, as they can on every other surface.
+    Inherited by everything created below it, nothing above it.
+    """
+    if not IS_WINDOWS:
+        return
+    _powershell(f'icacls "{path}" /grant "*{sid}:(OI)(CI)M" | Out-Null', check=False)
+
+
 def run_as_sandbox(command: str, env: dict, cwd: Optional[str],
                    timeout: int) -> tuple:
     """Run ``command`` as the sandbox account. Returns ``(rc, stdout, stderr)``.
