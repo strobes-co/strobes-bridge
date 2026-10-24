@@ -11,8 +11,8 @@ everywhere else):
   pushed -- transfers run as that account, so it can never reach more than
   the account itself could.
 
-A local HTTP server stands in for S3's presigned GET/PUT (loopback is not
-filtered by the Windows sandbox's egress rules).
+A local HTTP server stands in for S3's presigned GET/PUT. The bridge does the
+network side itself (its own traffic is outside the sandbox's egress scope).
 """
 
 import asyncio
@@ -70,15 +70,8 @@ def _sh(cmd):
 def test_sandboxed_command_reads_writes_and_pushes_the_workspace(store, tmp_path):
     from strobes_shell_agent import workspace
 
-    from strobes_shell_agent import executor
-
-    probe = asyncio.run(executor.execute_code(
-        "python", "import urllib.request,sys;print(sys.executable);"
-                  f"print(urllib.request.urlopen({store + '/docs/scope.md'!r}, timeout=20).read())",
-        timeout=120))
-    print("lane python probe:", probe)
     r = workspace.workspace_pull([{"path": "docs/scope.md", "url": store + "/docs/scope.md"}])
-    assert r["pulled"] == 1, (r["failed"], probe)
+    assert r["pulled"] == 1, r["failed"]
     root = str(workspace.workspace_root())
 
     out = _sh(f'type "{os.path.join(root, "docs", "scope.md")}"')

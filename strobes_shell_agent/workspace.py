@@ -365,7 +365,8 @@ def _push_from(root_fd: int, parts: List[str], url: str, content_type: str,
 # files with its own rights could be steered through them. So on Windows the
 # bridge never does: pulls and pushes run as small programs in the sandbox
 # lane, as the sandbox account, and can only reach what that account could
-# reach anyway. The scan only stats, skips reparse points and never opens a file.
+# reach anyway (the bridge still does the network transfer itself). The scan
+# only stats, skips reparse points and never opens a file.
 
 def _windows_sid() -> Optional[str]:
     """The sandbox account's SID when commands run as it, else None."""
@@ -381,45 +382,88 @@ def _windows_sid() -> Optional[str]:
 
 _LANE_MARK = "__STROBES_WS__"
 
-_LANE_PULL = """
-import os, urllib.request
-root, rel, url = {root!r}, {rel!r}, {url!r}
+#: Most a Windows push carries: the bytes come back through the lane's output.
+LANE_READ_MAX = 64 * 1024 * 1024
+
+# Network transfers stay with the bridge (its own traffic is not subject to the
+# engagement's egress scope; the sandbox account's is, so a scoped allowlist
+# would block storage). Only the file operations inside the workspace run as
+# the sandbox account.
+
+_LANE_PLACE = """
+import os, shutil
+root, rel, src = {root!r}, {rel!r}, {src!r}
 dest = os.path.realpath(os.path.join(root, rel))
 if not dest.startswith(os.path.realpath(root) + os.sep):
     raise SystemExit("outside the workspace")
 os.makedirs(os.path.dirname(dest), exist_ok=True)
 tmp = dest + ".strobes-part"
-with urllib.request.urlopen(url, timeout={timeout}) as r, open(tmp, "wb") as f:
-    while True:
-        chunk = r.read(262144)
-        if not chunk:
-            break
-        f.write(chunk)
+shutil.copyfile(src, tmp)
 os.replace(tmp, dest)
 print({mark!r} + "ok")
 """
 
-_LANE_PUSH = """
-import os, urllib.request
-root, rel, url, ctype = {root!r}, {rel!r}, {url!r}, {ctype!r}
+_LANE_READ = """
+import base64, os
+root, rel = {root!r}, {rel!r}
 src = os.path.realpath(os.path.join(root, rel))
 if not src.startswith(os.path.realpath(root) + os.sep) or not os.path.isfile(src):
     raise SystemExit("not a file in the workspace")
-req = urllib.request.Request(url, data=open(src, "rb").read(), method="PUT")
-req.add_header("Content-Type", ctype)
-urllib.request.urlopen(req, timeout={timeout})
-print({mark!r} + "ok")
+if os.path.getsize(src) > {limit}:
+    raise SystemExit("file too large for a Windows workspace push")
+print({mark!r} + "ok" + base64.b64encode(open(src, "rb").read()).decode())
 """
 
 
-def _run_in_lane(code: str, timeout: int) -> Dict[str, Any]:
+def _lane_pull(root: str, rel: str, url: str, timeout: int) -> Dict[str, Any]:
+    import tempfile
+
+    from . import sandbox
+
+    fd, tmp = tempfile.mkstemp(prefix="strobes-ws-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in _download(url, timeout):
+                f.write(chunk)
+        sandbox.adopt_path(tmp)  # read access for the sandbox account only
+        return _run_in_lane(_LANE_PLACE.format(root=root, rel=rel, src=tmp, mark=_LANE_MARK),
+                            timeout + 30)
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": str(e)}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _lane_push(root: str, rel: str, url: str, content_type: str, timeout: int) -> Dict[str, Any]:
+    import base64
+
+    out = _run_in_lane(_LANE_READ.format(root=root, rel=rel, limit=LANE_READ_MAX,
+                                          mark=_LANE_MARK), timeout + 30, keep_output=True)
+    if not out.get("success"):
+        return out
+    try:
+        data = base64.b64decode(out["payload"])
+        return {"success": True, "status": _upload(url, data, content_type, timeout)}
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": str(e)}
+
+
+def _run_in_lane(code: str, timeout: int, keep_output: bool = False) -> Dict[str, Any]:
     import asyncio
 
     from .executor import execute_code
 
     out = asyncio.run(execute_code("python", code, timeout=timeout))
-    if _LANE_MARK + "ok" in (out.get("stdout") or ""):
-        return {"success": True}
+    stdout = out.get("stdout") or ""
+    i = stdout.find(_LANE_MARK + "ok")
+    if i >= 0:
+        res: Dict[str, Any] = {"success": True}
+        if keep_output:
+            res["payload"] = stdout[i + len(_LANE_MARK) + 2:].split()[0] if stdout[i + len(_LANE_MARK) + 2:].strip() else ""
+        return res
     return {"success": False,
             "error": (out.get("stderr") or out.get("error") or "transfer failed").strip()[-300:]}
 
@@ -601,9 +645,7 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300,
             from .executor import _reject_bad_scheme
 
             bad = _reject_bad_scheme(url)
-            result = bad or _run_in_lane(_LANE_PULL.format(
-                root=str(workspace_root(workspace_id)), rel=rel, url=url,
-                timeout=timeout, mark=_LANE_MARK), timeout + 30)
+            result = bad or _lane_pull(str(workspace_root(workspace_id)), rel, url, timeout)
             if result.get("success"):
                 pulled += 1
             else:
@@ -718,10 +760,9 @@ def workspace_push(files: List[Dict[str, Any]], timeout: int = 300,
             from .executor import _reject_bad_scheme
 
             bad = _reject_bad_scheme(url)
-            result = bad or _run_in_lane(_LANE_PUSH.format(
-                root=str(workspace_root(workspace_id)), rel=rel, url=url,
-                ctype=(entry or {}).get("content_type") or "application/octet-stream",
-                timeout=timeout, mark=_LANE_MARK), timeout + 30)
+            result = bad or _lane_push(
+                str(workspace_root(workspace_id)), rel, url,
+                (entry or {}).get("content_type") or "application/octet-stream", timeout)
             if result.get("success"):
                 pushed += 1
             else:
