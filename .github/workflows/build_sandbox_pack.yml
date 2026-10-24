@@ -218,7 +218,7 @@ jobs:
   # the release on a pack-v* tag instead of gating it.
   # Why it may legitimately fail: `Responder` and `enum4linux-ng` are declared *nix-only
   # in tools.manifest.json, and `netexec` pulls a Rust dep (aardwolf) that has to compile
-  # from source on non-Linux runners — plus macos-13 (Intel) is a scarce, slow runner.
+  # from source on non-Linux runners — plus macos-15-intel (Intel) is a scarce, slow runner.
   # None of that may sink the release.
   internal-ad-macos:
     name: internal-ad-macos-${{ matrix.arch }}
@@ -231,7 +231,7 @@ jobs:
           - arch: aarch64
             runner: macos-14      # Apple silicon
           - arch: x86_64
-            runner: macos-13      # Intel
+            runner: macos-15-intel  # Intel (macos-13 is retired: jobs on it queued forever)
     steps:
       - uses: actions/checkout@v4
       - name: Checkout strobes-co/skills (baked into the pack)
@@ -355,7 +355,7 @@ jobs:
             sandbox_pack/out/strobes-sandbox-pack-internal-ad-windows-x86_64.tar.gz.sha256
 
   # Base pack on the runners that must build natively. macos-x86_64 is NOT listed here on
-  # purpose — the `native-intel` job below already covers it on the scarce macos-13 runner,
+  # purpose — the `native-intel` job below already covers it on the scarce macos-15-intel runner,
   # off the publish gate. Do not duplicate it into this matrix.
   native:
     name: ${{ matrix.triple }}
@@ -410,7 +410,7 @@ jobs:
   # can't block the release. It self-appends its pack to the release whenever it runs.
   native-intel:
     name: macos-x86_64
-    runs-on: macos-13
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - name: Checkout strobes-co/skills (baked into the pack)
