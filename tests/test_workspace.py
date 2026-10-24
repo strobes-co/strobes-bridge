@@ -22,6 +22,12 @@ def _home(tmp_path, monkeypatch):
     """A throwaway HOME, so tests never touch the real ~/.strobes."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # The workspace lives in the home COMMANDS see, which on a root host with
+    # nftables is the scan account's, not the bridge's. Pin it so these tests
+    # do not depend on the privileges of whoever runs them.
+    from strobes_shell_agent import sandbox
+
+    monkeypatch.setattr(sandbox, "command_home", lambda: str(tmp_path))
     return tmp_path
 
 

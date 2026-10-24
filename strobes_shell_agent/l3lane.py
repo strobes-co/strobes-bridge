@@ -40,6 +40,16 @@ from strobes_shell_agent.netpolicy import NetworkPolicy
 #: exists for no other purpose and nothing else should run as it.
 ACCOUNT = "strobes-scan"
 
+#: The account's home, and therefore the ``~`` every command in this lane sees.
+#: Commands run as the account but used to inherit the bridge's own HOME --
+#: usually /root, mode 0700 -- so every ``~`` path was unreachable to them: the
+#: workspace, ``pip install --user``, any tool's config or cache directory.
+ACCOUNT_HOME = "/var/lib/strobes-scan"
+
+#: Variables that would point a command back into the bridge user's home.
+_HOME_SCOPED_VARS = ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                     "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "PYTHONUSERBASE")
+
 #: Our own nftables table. Owned entirely by the bridge: loaded, replaced and
 #: deleted as a unit, so it never disturbs the host's other rules.
 TABLE = "strobes_scope"
@@ -104,22 +114,36 @@ def account_uid() -> Optional[int]:
 
 
 def ensure_account() -> int:
-    """Create the scan account if missing, and return its uid."""
-    uid = account_uid()
-    if uid is not None:
-        return uid
-    for argv in (
-        ["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", ACCOUNT],
-        ["adduser", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", ACCOUNT],
-    ):
-        if shutil.which(argv[0]) is None:
-            continue
-        if subprocess.run(argv, capture_output=True).returncode == 0:
-            break
+    """Create the scan account if missing, give it its home, return its uid."""
     uid = account_uid()
     if uid is None:
-        raise L3Unavailable(f"could not create the {ACCOUNT} account")
+        for argv in (
+            ["useradd", "--system", "--home-dir", ACCOUNT_HOME, "--no-create-home",
+             "--shell", "/usr/sbin/nologin", ACCOUNT],
+            ["adduser", "--system", "--home", ACCOUNT_HOME, "--no-create-home",
+             "--shell", "/usr/sbin/nologin", ACCOUNT],
+        ):
+            if shutil.which(argv[0]) is None:
+                continue
+            if subprocess.run(argv, capture_output=True).returncode == 0:
+                break
+        uid = account_uid()
+        if uid is None:
+            raise L3Unavailable(f"could not create the {ACCOUNT} account")
+    # Every time, not only on creation: accounts made by earlier versions were
+    # created without a home at all.
+    ensure_home(uid)
     return uid
+
+
+def ensure_home(uid: int) -> str:
+    """Create ``ACCOUNT_HOME`` owned by the account, private to it."""
+    os.makedirs(ACCOUNT_HOME, mode=0o700, exist_ok=True)
+    try:
+        os.chown(ACCOUNT_HOME, uid, uid)
+    except OSError:
+        pass
+    return ACCOUNT_HOME
 
 
 def grant_raw_capabilities(search_path: Optional[str] = None) -> dict:
@@ -212,6 +236,11 @@ def environment(base: Optional[dict] = None) -> dict:
     # non-root uid holding CAP_NET_RAW may raw-scan. Without this it silently
     # downgrades to a connect scan.
     env["NMAP_PRIVILEGED"] = "1"
+    # The account's own home, not the bridge's: see ACCOUNT_HOME.
+    env["HOME"] = ACCOUNT_HOME
+    env["USER"] = env["LOGNAME"] = ACCOUNT
+    for var in _HOME_SCOPED_VARS:
+        env.pop(var, None)
     return env
 
 

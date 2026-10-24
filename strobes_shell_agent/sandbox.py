@@ -90,6 +90,11 @@ class Lane:
 
             if l3lane.available():
                 uid = await asyncio.to_thread(l3lane.ensure_account)
+                # Commands run as the account, which cannot enter a pack kept
+                # under the bridge user's home (or PyInstaller's private
+                # extraction dir). Before the capabilities, so they are granted
+                # on the copies commands will actually run.
+                await asyncio.to_thread(pack.share_with, uid)
                 caps = await asyncio.to_thread(l3lane.grant_raw_capabilities,
                                                pack.build_env().get("PATH"))
                 await asyncio.to_thread(l3lane.apply_policy, self.policy, uid)
@@ -359,6 +364,35 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
             "Windows sandbox; use shell_execute, which is confined"
         )
     return box.wrap_shell(command), box.env(base_env or pack.build_env())
+
+
+def _command_uid() -> Optional[int]:
+    """The uid commands run as when it is not the bridge's own, else None.
+
+    Resolved without needing the lane to be running, because files are written
+    for commands (the workspace at connect, an interpreter source file) before
+    the first command starts it.
+    """
+    if _lane is not None and _lane._l3_uid is not None:
+        return _lane._l3_uid
+    started = _lane is not None and _lane._sandbox is not None
+    # Not started yet: the lane will pick l3 exactly when it is available.
+    if not started and l3lane.available():
+        return l3lane.account_uid() or l3lane.ensure_account()
+    return None
+
+
+def command_home() -> str:
+    """Where ``~`` resolves for commands -- the home the agent works in.
+
+    The bridge's own home on every lane where commands run as the bridge's user;
+    the scan account's home in the packet-filter lane, where they do not. Files
+    the bridge places for the agent (the workspace) must go here, or the agent
+    looks in one home and finds them in another.
+    """
+    if _command_uid() is not None:
+        return l3lane.ACCOUNT_HOME
+    return os.path.expanduser("~")
 
 
 def adopt_path(path: str) -> None:

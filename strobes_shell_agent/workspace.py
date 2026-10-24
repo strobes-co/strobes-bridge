@@ -50,12 +50,93 @@ WORKSPACE_DIRNAME = os.path.join(".strobes", "workspace")
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def workspace_root() -> Path:
-    """``~/.strobes/workspace``, resolved."""
-    return (Path.home() / WORKSPACE_DIRNAME).resolve()
+def _home() -> Path:
+    """The home commands see, which is not always the bridge's own.
+
+    In the packet-filter lane commands run as a separate account with its own
+    home; a workspace placed in the bridge's home would be a directory the
+    agent's ``~/.strobes/workspace`` never names, and often cannot even enter.
+    """
+    from . import sandbox
+
+    return Path(sandbox.command_home())
 
 
-def _safe_target(rel_path: str) -> Optional[Path]:
+#: Per-workspace homes, so one bridge serving many workspaces keeps each one's
+#: files apart. The platform runs every command for workspace W with
+#: HOME=<home>/.strobes/homes/W, so ``~/.strobes/workspace`` there is W's own.
+#: Advertised to the platform as the ``workspace_homes`` feature.
+HOMES_DIRNAME = os.path.join(".strobes", "homes")
+
+
+def _workspace_home(workspace_id: Optional[str]) -> Optional[Path]:
+    """``<home>/.strobes/homes/<id>`` for a well-formed id, else None."""
+    if not workspace_id:
+        return None
+    import uuid
+
+    try:
+        ws = str(uuid.UUID(str(workspace_id)))
+    except (TypeError, ValueError):
+        return None
+    return _home() / HOMES_DIRNAME / ws
+
+
+def _ensure_workspace_home(home: Path) -> None:
+    """Create the home and link every other entry of the real home into it,
+    so the user's own keys, config and tools are still there under HOME."""
+    real = _home()
+    (home / WORKSPACE_DIRNAME).mkdir(parents=True, exist_ok=True)
+    _adopt_within(real, home / WORKSPACE_DIRNAME)
+    for entry in real.iterdir():
+        if entry.name == ".strobes":
+            continue
+        link = home / entry.name
+        if not os.path.lexists(link):
+            try:
+                os.symlink(entry, link)
+            except OSError:
+                pass
+
+
+def workspace_root(workspace_id: Optional[str] = None) -> Path:
+    """``~/.strobes/workspace`` as commands see it, resolved -- the workspace's
+    own when ``workspace_id`` is given, the shared one otherwise."""
+    home = _workspace_home(workspace_id)
+    return ((home or _home()) / WORKSPACE_DIRNAME).resolve()
+
+
+def _adopt_within(base: Path, path: Path) -> None:
+    """Hand ``path`` and each directory between ``base`` and it to the identity
+    commands run as. A no-op where that is the bridge's own user."""
+    from . import sandbox
+
+    try:
+        rel = path.relative_to(base)
+    except ValueError:
+        return
+    current = base
+    sandbox.adopt_path(str(current))
+    for part in rel.parts:
+        current = current / part
+        sandbox.adopt_path(str(current))
+
+
+def _single_link(path: Path) -> bool:
+    """False for a file with other hard links.
+
+    The workspace belongs to the account commands run as, while the bridge
+    reads it to push files back. A hard link planted there to a file only the
+    bridge can read would otherwise be uploaded on its behalf; symlinks are
+    refused for the same reason.
+    """
+    try:
+        return path.stat().st_nlink == 1
+    except OSError:
+        return False
+
+
+def _safe_target(rel_path: str, workspace_id: Optional[str] = None) -> Optional[Path]:
     """Resolve ``rel_path`` inside the workspace, or None if it escapes.
 
     The boundary that the mount gets from its access point's root directory,
@@ -67,7 +148,7 @@ def _safe_target(rel_path: str) -> Optional[Path]:
     Checked after resolution, not by inspecting the string, so ``..`` segments,
     absolute paths and symlinked parents are all covered by the same test.
     """
-    root = workspace_root()
+    root = workspace_root(workspace_id)
     candidate = (root / rel_path).resolve()
     try:
         candidate.relative_to(root)
@@ -90,7 +171,7 @@ def _sha256(path: Path) -> Optional[str]:
         return None
 
 
-def workspace_ensure() -> Dict[str, Any]:
+def workspace_ensure(workspace_id: Optional[str] = None) -> Dict[str, Any]:
     """Create the workspace directory, and report where it is.
 
     Called at connect, alongside the skills linking, so the path exists before
@@ -98,15 +179,22 @@ def workspace_ensure() -> Dict[str, Any]:
     expected to exist and finds ENOENT reports "the workspace is broken",
     which is indistinguishable from the feature being absent.
     """
-    root = Path.home() / WORKSPACE_DIRNAME
+    ws_home = _workspace_home(workspace_id)
     try:
+        if ws_home is not None:
+            _ensure_workspace_home(ws_home)
+            return {"success": True, "path": str(ws_home / WORKSPACE_DIRNAME)}
+        home = _home()
+        root = home / WORKSPACE_DIRNAME
         root.mkdir(parents=True, exist_ok=True)
+        _adopt_within(home, root)
         return {"success": True, "path": str(root)}
     except OSError as e:
-        return {"success": False, "error": f"cannot create {root}: {e}"}
+        return {"success": False, "error": f"cannot create the workspace: {e}"}
 
 
-def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str, Any]:
+def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300,
+                   workspace_id: Optional[str] = None) -> Dict[str, Any]:
     """Fetch workspace files onto this machine.
 
     ``files`` is ``[{"path": "reports/a.pdf", "url": <presigned GET>,
@@ -122,7 +210,7 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str,
     """
     from .executor import file_pull
 
-    ensured = workspace_ensure()
+    ensured = workspace_ensure(workspace_id)
     if not ensured.get("success"):
         return {"success": False, "error": ensured.get("error"), "pulled": 0}
 
@@ -131,7 +219,7 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str,
         rel = (entry or {}).get("path") or ""
         url = (entry or {}).get("url") or ""
         want = (entry or {}).get("sha256")
-        target = _safe_target(rel)
+        target = _safe_target(rel, workspace_id)
         if target is None or not url:
             failed.append({"path": rel, "error": "invalid path or url"})
             continue
@@ -148,20 +236,22 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str,
 
         result = file_pull(str(target), url, want, timeout)
         if result.get("success"):
+            _adopt_within(workspace_root(workspace_id), target)
             pulled += 1
         else:
             failed.append({"path": rel, "error": result.get("error")})
 
     return {
         "success": not failed,
-        "path": str(workspace_root()),
+        "path": str(workspace_root(workspace_id)),
         "pulled": pulled,
         "skipped": skipped,
         "failed": failed,
     }
 
 
-def workspace_scan(include_sha256: bool = True) -> Dict[str, Any]:
+def workspace_scan(include_sha256: bool = True,
+                   workspace_id: Optional[str] = None) -> Dict[str, Any]:
     """What is in the workspace on this machine, for the backend to diff.
 
     Returns one entry per file: relative path, size, mtime and (by default) a
@@ -173,13 +263,13 @@ def workspace_scan(include_sha256: bool = True) -> Dict[str, Any]:
     worth having, because hashing a directory of large captures is not free and
     mtime alone is enough to rule most files out.
     """
-    root = workspace_root()
+    root = workspace_root(workspace_id)
     if not root.is_dir():
         return {"success": True, "path": str(root), "files": []}
 
     out: List[Dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or not _single_link(path):
             # Symlinks are skipped deliberately: following one would upload
             # whatever it points at, which on a customer's machine is an
             # arbitrary-file-read dressed up as a workspace sync.
@@ -199,7 +289,8 @@ def workspace_scan(include_sha256: bool = True) -> Dict[str, Any]:
     return {"success": True, "path": str(root), "files": out}
 
 
-def workspace_push(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str, Any]:
+def workspace_push(files: List[Dict[str, Any]], timeout: int = 300,
+                   workspace_id: Optional[str] = None) -> Dict[str, Any]:
     """Send named workspace files back, each to a presigned PUT.
 
     ``files`` is ``[{"path": ..., "url": <presigned PUT>, "content_type": ...}]``.
@@ -212,12 +303,15 @@ def workspace_push(files: List[Dict[str, Any]], timeout: int = 300) -> Dict[str,
     for entry in files or []:
         rel = (entry or {}).get("path") or ""
         url = (entry or {}).get("url") or ""
-        target = _safe_target(rel)
+        target = _safe_target(rel, workspace_id)
         if target is None or not url:
             failed.append({"path": rel, "error": "invalid path or url"})
             continue
         if not target.is_file():
             failed.append({"path": rel, "error": "not a file on this machine"})
+            continue
+        if not _single_link(target):
+            failed.append({"path": rel, "error": "refusing a file with other hard links"})
             continue
         result = file_push(
             str(target), url, (entry or {}).get("content_type") or "application/octet-stream", timeout
