@@ -88,6 +88,10 @@ jobs:
         if: runner.os == 'Windows'
         run: strobes-shell-agent sandbox-setup
 
+      - name: Verify a sandboxed command can use the workspace (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pytest tests/test_windows_workspace_access.py -v
+
       # Linux needs root for this, and not as a convenience: the preferred
       # lane is packet-level nftables, and `l3lane.available()` probes for
       # CAP_NET_ADMIN by listing the ruleset. Unprivileged, it falls back to
