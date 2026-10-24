@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -354,6 +355,103 @@ def _push_from(root_fd: int, parts: List[str], url: str, content_type: str,
         os.close(fd)
 
 
+# ---------------------------------------------------------------------------
+# Windows: transfers run AS the sandbox account
+# ---------------------------------------------------------------------------
+#
+# Windows has no O_NOFOLLOW/dir_fd, and once the sandbox account may write the
+# workspace (it must, to save output) it can plant directory junctions there --
+# any user with write access can. A bridge that then read or wrote workspace
+# files with its own rights could be steered through them. So on Windows the
+# bridge never does: pulls and pushes run as small programs in the sandbox
+# lane, as the sandbox account, and can only reach what that account could
+# reach anyway. The scan only stats, skips reparse points and never opens a file.
+
+def _windows_sid() -> Optional[str]:
+    """The sandbox account's SID when commands run as it, else None."""
+    if sys.platform != "win32":
+        return None
+    from . import procsandbox, winsandbox
+
+    if procsandbox.detect_backend() != procsandbox.WINDOWS:
+        return None
+    state = winsandbox.load_state() or {}
+    return state.get("sid")
+
+
+_LANE_MARK = "__STROBES_WS__"
+
+_LANE_PULL = """
+import os, urllib.request
+root, rel, url = {root!r}, {rel!r}, {url!r}
+dest = os.path.realpath(os.path.join(root, rel))
+if not dest.startswith(os.path.realpath(root) + os.sep):
+    raise SystemExit("outside the workspace")
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+tmp = dest + ".strobes-part"
+with urllib.request.urlopen(url, timeout={timeout}) as r, open(tmp, "wb") as f:
+    while True:
+        chunk = r.read(262144)
+        if not chunk:
+            break
+        f.write(chunk)
+os.replace(tmp, dest)
+print({mark!r} + "ok")
+"""
+
+_LANE_PUSH = """
+import os, urllib.request
+root, rel, url, ctype = {root!r}, {rel!r}, {url!r}, {ctype!r}
+src = os.path.realpath(os.path.join(root, rel))
+if not src.startswith(os.path.realpath(root) + os.sep) or not os.path.isfile(src):
+    raise SystemExit("not a file in the workspace")
+req = urllib.request.Request(url, data=open(src, "rb").read(), method="PUT")
+req.add_header("Content-Type", ctype)
+urllib.request.urlopen(req, timeout={timeout})
+print({mark!r} + "ok")
+"""
+
+
+def _run_in_lane(code: str, timeout: int) -> Dict[str, Any]:
+    import asyncio
+
+    from .executor import execute_code
+
+    out = asyncio.run(execute_code("python", code, timeout=timeout))
+    if _LANE_MARK + "ok" in (out.get("stdout") or ""):
+        return {"success": True}
+    return {"success": False,
+            "error": (out.get("stderr") or out.get("error") or "transfer failed").strip()[-300:]}
+
+
+def _scan_windows(root: Path) -> List[Dict[str, Any]]:
+    """List regular files without following links or junctions, nor opening any."""
+    import stat as _stat
+
+    reparse = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    out: List[Dict[str, Any]] = []
+    stack = [(root, "")]
+    while stack:
+        d, prefix = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if e.is_symlink() or getattr(st, "st_file_attributes", 0) & reparse:
+                continue
+            rel = f"{prefix}{e.name}"
+            if _stat.S_ISDIR(st.st_mode):
+                stack.append((Path(e.path), rel + "/"))
+            elif _stat.S_ISREG(st.st_mode):
+                out.append({"path": rel, "size": st.st_size, "mtime": st.st_mtime})
+    return sorted(out, key=lambda f: f["path"])
+
+
 def workspace_root(workspace_id: Optional[str] = None) -> Path:
     """``~/.strobes/workspace`` as commands see it, resolved -- the workspace's
     own when ``workspace_id`` is given, the shared one otherwise."""
@@ -444,11 +542,21 @@ def workspace_ensure(workspace_id: Optional[str] = None) -> Dict[str, Any]:
     try:
         if ws_home is not None:
             _ensure_workspace_home(ws_home)
+            sid = _windows_sid()
+            if sid:
+                from . import winsandbox
+
+                winsandbox.grant_modify_access(str(ws_home / WORKSPACE_DIRNAME), sid)
             return {"success": True, "path": str(ws_home / WORKSPACE_DIRNAME)}
         home = _home()
         root = home / WORKSPACE_DIRNAME
         root.mkdir(parents=True, exist_ok=True)
         _adopt_within(home, root)
+        sid = _windows_sid()
+        if sid:
+            from . import winsandbox
+
+            winsandbox.grant_modify_access(str(root), sid)
         return {"success": True, "path": str(root)}
     except OSError as e:
         return {"success": False, "error": f"cannot create the workspace: {e}"}
@@ -478,6 +586,7 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300,
     if not ensured.get("success"):
         return {"success": False, "error": ensured.get("error"), "pulled": 0}
 
+    sid = _windows_sid()
     pulled, skipped, failed = 0, 0, []
     for entry in files or []:
         rel = (entry or {}).get("path") or ""
@@ -486,6 +595,19 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300,
         target = _safe_target(rel, workspace_id)
         if target is None or not url:
             failed.append({"path": rel, "error": "invalid path or url"})
+            continue
+
+        if sid:
+            from .executor import _reject_bad_scheme
+
+            bad = _reject_bad_scheme(url)
+            result = bad or _run_in_lane(_LANE_PULL.format(
+                root=str(workspace_root(workspace_id)), rel=rel, url=url,
+                timeout=timeout, mark=_LANE_MARK), timeout + 30)
+            if result.get("success"):
+                pulled += 1
+            else:
+                failed.append({"path": rel, "error": result.get("error")})
             continue
 
         if want and target.is_file() and _sha256(target) == want:
@@ -545,6 +667,8 @@ def workspace_scan(include_sha256: bool = True,
         return {"success": True, "path": str(root), "files": out_fd}
     if not root.is_dir():
         return {"success": True, "path": str(root), "files": []}
+    if _windows_sid():
+        return {"success": True, "path": str(root), "files": _scan_windows(root)}
 
     out: List[Dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
@@ -581,6 +705,7 @@ def workspace_push(files: List[Dict[str, Any]], timeout: int = 300,
     if _FD_SAFE:
         return _workspace_push_fd(files, timeout, workspace_id)
 
+    sid = _windows_sid()
     pushed, failed = 0, []
     for entry in files or []:
         rel = (entry or {}).get("path") or ""
@@ -588,6 +713,19 @@ def workspace_push(files: List[Dict[str, Any]], timeout: int = 300,
         target = _safe_target(rel, workspace_id)
         if target is None or not url:
             failed.append({"path": rel, "error": "invalid path or url"})
+            continue
+        if sid:
+            from .executor import _reject_bad_scheme
+
+            bad = _reject_bad_scheme(url)
+            result = bad or _run_in_lane(_LANE_PUSH.format(
+                root=str(workspace_root(workspace_id)), rel=rel, url=url,
+                ctype=(entry or {}).get("content_type") or "application/octet-stream",
+                timeout=timeout, mark=_LANE_MARK), timeout + 30)
+            if result.get("success"):
+                pushed += 1
+            else:
+                failed.append({"path": rel, "error": result.get("error")})
             continue
         if not target.is_file():
             failed.append({"path": rel, "error": "not a file on this machine"})
