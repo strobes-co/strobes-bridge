@@ -42,6 +42,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The agent's version lives in pyproject.toml and __init__.py, and a tag
+      # does not change either: v0.4.2 and v0.5.1 both shipped binaries that
+      # reported 0.5.0. Write the tag's version in before building, so the
+      # binary, the image and the release can never disagree.
+      - name: Stamp the agent version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^__version__ = .*/__version__ = \"$v\"/" strobes_shell_agent/__init__.py
+          sed -i.bak "s/^version = .*/version = \"$v\"/" pyproject.toml
+          rm -f strobes_shell_agent/__init__.py.bak pyproject.toml.bak
+          grep -qx "__version__ = \"$v\"" strobes_shell_agent/__init__.py
+          grep -qx "version = \"$v\"" pyproject.toml
+          echo "agent version: $v"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -103,6 +119,22 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+
+      # The agent's version lives in pyproject.toml and __init__.py, and a tag
+      # does not change either: v0.4.2 and v0.5.1 both shipped binaries that
+      # reported 0.5.0. Write the tag's version in before building, so the
+      # binary, the image and the release can never disagree.
+      - name: Stamp the agent version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^__version__ = .*/__version__ = \"$v\"/" strobes_shell_agent/__init__.py
+          sed -i.bak "s/^version = .*/version = \"$v\"/" pyproject.toml
+          rm -f strobes_shell_agent/__init__.py.bak pyproject.toml.bak
+          grep -qx "__version__ = \"$v\"" strobes_shell_agent/__init__.py
+          grep -qx "version = \"$v\"" pyproject.toml
+          echo "agent version: $v"
       - name: Install toolchain (C + Rust + binutils + git for the internal-ad pack)
         run: |
           sudo apt-get update
@@ -139,6 +171,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # The agent's version lives in pyproject.toml and __init__.py, and a tag
+      # does not change either: v0.4.2 and v0.5.1 both shipped binaries that
+      # reported 0.5.0. Write the tag's version in before building, so the
+      # binary, the image and the release can never disagree.
+      - name: Stamp the agent version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^__version__ = .*/__version__ = \"$v\"/" strobes_shell_agent/__init__.py
+          sed -i.bak "s/^version = .*/version = \"$v\"/" pyproject.toml
+          rm -f strobes_shell_agent/__init__.py.bak pyproject.toml.bak
+          grep -qx "__version__ = \"$v\"" strobes_shell_agent/__init__.py
+          grep -qx "version = \"$v\"" pyproject.toml
+          echo "agent version: $v"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
