@@ -244,7 +244,7 @@ jobs:
 
             ### Docker (multi-arch: amd64 + arm64)
             ```bash
-            docker run --rm --env-file .env ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }} connect
+            docker run --rm --cap-add NET_ADMIN --env-file .env ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }} connect
             ```
 
             ### Docker Compose
@@ -253,6 +253,7 @@ jobs:
               shell-agent:
                 image: ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
                 env_file: .env
+                cap_add: [NET_ADMIN]  # egress sandbox; without it commands are refused
                 restart: unless-stopped
             ```
 
