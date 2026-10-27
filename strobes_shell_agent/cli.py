@@ -206,8 +206,13 @@ def connect(url, api_key, org_id, bridge_id, name, cwd, ssl_verify, verbose,
     click.echo(f"  Egress:     {_describe_egress(policy)}")
     click.echo()
     if not policy["sandbox"]["available"]:
-        click.echo("WARNING: no process sandbox on this platform — commands "
-                   "will be refused rather than run unconfined.", err=True)
+        if sys.platform == "win32":
+            click.echo("WARNING: Windows sandbox not configured — commands will run "
+                       "unconfined. Run `sandbox-setup` from an elevated prompt to "
+                       "enable egress enforcement.", err=True)
+        else:
+            click.echo("WARNING: no process sandbox on this platform — commands "
+                       "will be refused rather than run unconfined.", err=True)
         click.echo()
 
     # Handle graceful shutdown
