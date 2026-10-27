@@ -65,6 +65,7 @@ class Lane:
         self._sandbox: Optional[ProcSandbox] = None
         self._socket_path: Optional[str] = None
         self._l3_uid: Optional[int] = None
+        self._win_unconfined: bool = False
         self._lock = asyncio.Lock()
 
     # -- lifecycle ----------------------------------------------------------
@@ -85,7 +86,7 @@ class Lane:
         weaker but needs no privileges.
         """
         async with self._lock:
-            if self._sandbox is not None or self._l3_uid is not None:
+            if self._sandbox is not None or self._l3_uid is not None or self._win_unconfined:
                 return self._sandbox
 
             if l3lane.available():
@@ -108,9 +109,19 @@ class Lane:
 
             backend = procsandbox.detect_backend()
             if backend is None:
+                if sys.platform == "win32" and self.policy.is_open:
+                    # WFP sandbox not configured but no egress scope is enforced —
+                    # execute unconfined rather than refuse. If the operator later
+                    # pushes a scoped policy we refuse at run time (see run_shell).
+                    logger.warning(
+                        "Windows sandbox not configured — commands will run unconfined. "
+                        "Run `sandbox-setup` from an elevated prompt to enable egress enforcement."
+                    )
+                    self._win_unconfined = True
+                    return None
                 raise SandboxUnavailable(
                     "no process sandbox available on this host "
-                    f"(platform={os.sys.platform}); refusing to run commands "
+                    f"(platform={sys.platform}); refusing to run commands "
                     "with unrestricted network access"
                 )
 
@@ -155,6 +166,7 @@ class Lane:
             except OSError:
                 pass
             self._socket_path = None
+        self._win_unconfined = False
 
     def set_policy(self, policy: NetworkPolicy) -> None:
         """Apply a new policy without restarting anything.
@@ -184,6 +196,15 @@ class Lane:
         except SandboxUnavailable as e:
             return _result(False, stderr=str(e), exit_code=-1, start=start,
                            error="sandbox_unavailable")
+
+        if self._win_unconfined:
+            if not self.policy.is_open:
+                return _result(False, start=start, exit_code=-1,
+                               stderr="egress policy is scoped but the Windows sandbox is not "
+                                      "configured; run `sandbox-setup` from an elevated prompt",
+                               error="sandbox_unavailable")
+            from strobes_shell_agent.executor import _execute_shell_command_host
+            return await _execute_shell_command_host(command, timeout=timeout, cwd=cwd)
 
         if cwd and not os.path.isdir(cwd):
             cwd = None
@@ -350,6 +371,14 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
     if lane._l3_uid is not None:
         return (l3lane.wrap_shell(command, lane._l3_uid),
                 l3lane.environment(base_env or pack.build_env()))
+    if lane._win_unconfined:
+        if not lane.policy.is_open:
+            raise SandboxUnavailable(
+                "egress policy is scoped but the Windows sandbox is not configured; "
+                "run `sandbox-setup` from an elevated prompt"
+            )
+        env = base_env or pack.build_env()
+        return (["cmd.exe", "/c", command], env)
     box = lane._sandbox
     if box is None:
         raise SandboxUnavailable(
