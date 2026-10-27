@@ -747,3 +747,72 @@ async def test_packet_filter_lane_runs_scanners_normally():
     assert "Nmap version" in result["stdout"], result
     assert result["lane"]["raw_sockets"] is True
     await sb.get_lane().stop()
+
+
+# ---------------------------------------------------------------------------
+# Capability detection tells the truth
+# ---------------------------------------------------------------------------
+
+
+def test_an_installed_but_unusable_bwrap_is_not_a_backend(monkeypatch):
+    """Having the binary is not the same as being able to use it.
+
+    bubblewrap needs unprivileged user namespaces, which CI runners, hardened
+    kernels and many container runtimes refuse. `--unshare-net` then dies with
+    `RTM_NEWADDR: Operation not permitted`.
+
+    Detection used to key off `shutil.which("bwrap")`, so such a host passed as
+    sandboxed and then failed EVERY command with that raw bwrap message --
+    which reads as a broken command rather than a host that cannot sandbox.
+    """
+    procsandbox.reset()
+    monkeypatch.setattr(procsandbox.sys, "platform", "linux")
+    monkeypatch.setattr(procsandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(procsandbox.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 1})())
+    assert procsandbox.detect_backend() is None
+    assert procsandbox.available() is False
+    procsandbox.reset()
+
+
+def test_a_working_bwrap_is_a_backend(monkeypatch):
+    """Control: the probe must not reject a host that can in fact sandbox."""
+    procsandbox.reset()
+    monkeypatch.setattr(procsandbox.sys, "platform", "linux")
+    monkeypatch.setattr(procsandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(procsandbox.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0})())
+    assert procsandbox.detect_backend() == procsandbox.BUBBLEWRAP
+    procsandbox.reset()
+
+
+def test_the_probe_uses_the_flag_that_actually_fails(monkeypatch):
+    """It is `--unshare-net` that a host without userns permission rejects.
+
+    A probe that omitted it would pass on exactly the hosts this exists to
+    catch, and the bug would survive the test.
+    """
+    procsandbox.reset()
+    seen = []
+    monkeypatch.setattr(procsandbox.sys, "platform", "linux")
+    monkeypatch.setattr(procsandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(procsandbox.subprocess, "run",
+                        lambda argv, **k: (seen.append(list(argv)),
+                                           type("R", (), {"returncode": 0})())[1])
+    procsandbox.detect_backend()
+    assert seen and "--unshare-net" in seen[0], seen
+    procsandbox.reset()
+
+
+def test_probe_failure_modes_all_mean_unavailable(monkeypatch):
+    """Timeout, missing binary and permission error are one answer, not three."""
+    for exc in (OSError("no such file"),
+                procsandbox.subprocess.TimeoutExpired("bwrap", 10),
+                PermissionError("denied")):
+        procsandbox.reset()
+        monkeypatch.setattr(procsandbox.sys, "platform", "linux")
+        monkeypatch.setattr(procsandbox.shutil, "which", lambda _: "/usr/bin/bwrap")
+        def boom(*a, **k): raise exc
+        monkeypatch.setattr(procsandbox.subprocess, "run", boom)
+        assert procsandbox.detect_backend() is None, exc
+    procsandbox.reset()

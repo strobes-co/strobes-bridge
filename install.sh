@@ -112,6 +112,22 @@ if [ -n "$SUDO" ]; then $SUDO mv "$TMP" "$TARGET"; else mv "$TMP" "$TARGET"; fi
 c_green "Installed: $TARGET"
 case ":$PATH:" in *":$BINDIR:"*) : ;; *) c_blue "note: add $BINDIR to your PATH";; esac
 
+# --- egress sandbox (Linux) ---------------------------------------------------
+# AI-issued commands run only inside an egress sandbox; without one the bridge
+# refuses them. macOS ships Seatbelt; on Linux it is a system package, so say
+# exactly what to install rather than installing it behind the user's back.
+if [ "$os" = "Linux" ] && ! command -v bwrap >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then PKG="sudo apt-get install -y bubblewrap"
+  elif command -v dnf >/dev/null 2>&1; then PKG="sudo dnf install -y bubblewrap"
+  elif command -v yum >/dev/null 2>&1; then PKG="sudo yum install -y bubblewrap"
+  elif command -v apk >/dev/null 2>&1; then PKG="sudo apk add bubblewrap"
+  else PKG="install bubblewrap with your package manager"; fi
+  c_red "warning: no egress sandbox on this host — the bridge will refuse AI-issued commands."
+  echo  "   Fix:     $PKG"
+  echo  "            (or run as root with nftables installed, for the packet-filter lane)"
+  echo  "   Verify:  $BIN_NAME sandbox-check"
+fi
+
 # --- interactive setup (reads the terminal even when piped via curl|bash) ----
 ask() { # ask VAR "Prompt" [silent]
   local __v="$1" __p="$2" __s="${3:-}" __cur ans

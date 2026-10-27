@@ -91,6 +91,11 @@ class Lane:
 
             if l3lane.available():
                 uid = await asyncio.to_thread(l3lane.ensure_account)
+                # Commands run as the account, which cannot enter a pack kept
+                # under the bridge user's home (or PyInstaller's private
+                # extraction dir). Before the capabilities, so they are granted
+                # on the copies commands will actually run.
+                await asyncio.to_thread(pack.share_with, uid)
                 caps = await asyncio.to_thread(l3lane.grant_raw_capabilities,
                                                pack.build_env().get("PATH"))
                 await asyncio.to_thread(l3lane.apply_policy, self.policy, uid)
@@ -390,6 +395,35 @@ def confine(command: str, base_env: Optional[dict] = None) -> tuple:
     return box.wrap_shell(command), box.env(base_env or pack.build_env())
 
 
+def _command_uid() -> Optional[int]:
+    """The uid commands run as when it is not the bridge's own, else None.
+
+    Resolved without needing the lane to be running, because files are written
+    for commands (the workspace at connect, an interpreter source file) before
+    the first command starts it.
+    """
+    if _lane is not None and _lane._l3_uid is not None:
+        return _lane._l3_uid
+    started = _lane is not None and _lane._sandbox is not None
+    # Not started yet: the lane will pick l3 exactly when it is available.
+    if not started and l3lane.available():
+        return l3lane.account_uid() or l3lane.ensure_account()
+    return None
+
+
+def command_home() -> str:
+    """Where ``~`` resolves for commands -- the home the agent works in.
+
+    The bridge's own home on every lane where commands run as the bridge's user;
+    the scan account's home in the packet-filter lane, where they do not. Files
+    the bridge places for the agent (the workspace) must go here, or the agent
+    looks in one home and finds them in another.
+    """
+    if _command_uid() is not None:
+        return l3lane.ACCOUNT_HOME
+    return os.path.expanduser("~")
+
+
 def adopt_path(path: str) -> None:
     """Make ``path`` usable by the identity commands run as.
 
@@ -558,10 +592,31 @@ async def selftest() -> dict:
         # strict a check on those backends.
         # "python3" is the POSIX convention; Windows installs ship "python" only.
         python_bin = "python" if sys.platform == "win32" else "python3"
+
+        # WHICH destination proves the claim depends on the lane, because the
+        # claim is about the socket layer while the policy is about addresses.
+        #
+        # Under the packet filter, `raw_sockets: True` means a tool may use
+        # ordinary sockets -- it does NOT mean it may reach anywhere. An
+        # out-of-scope address is blocked by design, so probing one and
+        # demanding success asks the lane to break its own policy to prove a
+        # capability. That is what this used to do, and it failed every
+        # correctly-configured Linux host: mode=l3, "LANE MISREPORTS ITSELF".
+        # The discriminating probe there is an IN-SCOPE address, which a raw
+        # socket must reach and which under a proxy lane it could not.
+        #
+        # Under the proxy lane the in-scope address is the loopback origin, and
+        # Windows Filtering Platform does not filter loopback at all (see
+        # winsandbox.block_rules) -- so an in-scope probe would report every
+        # Windows host as raw-socket-capable. There the out-of-scope address is
+        # the honest discriminator, and it is also the one that matters: it
+        # answers "can a proxy-blind tool escape confinement".
+        cap_host, cap_port = (("127.0.0.1", port) if lane.mode == "l3"
+                              else (blackhole, 443))
         probe = await lane.run_shell(
             f'{python_bin} -c "import socket,sys;'
             "s=socket.socket();s.settimeout(4);"
-            f"s.connect(('{blackhole}',443));print('DIRECT_OK')\" 2>&1 "
+            f"s.connect(('{cap_host}',{cap_port}));print('DIRECT_OK')\" 2>&1 "
             "|| echo DIRECT_BLOCKED", timeout=25)
         direct_ok = "DIRECT_OK" in (probe.get("stdout") or "")
         claimed = capabilities(lane.mode)["raw_sockets"]

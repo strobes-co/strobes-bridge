@@ -189,7 +189,7 @@ class ShellBridgeClient:
                 "agent_version": AGENT_VERSION,
                 "pack": pack.status(),
                 # Capabilities the platform can rely on for this daemon.
-                "features": ["bg_exec"],
+                "features": ["bg_exec", "workspace_homes"],
             },
         }))
 
@@ -505,19 +505,22 @@ class ShellBridgeClient:
 
         # --- Workspace: the ~/.strobes/workspace a bridge cannot mount -------
         elif command == "workspace_ensure":
-            return await asyncio.to_thread(workspace.workspace_ensure)
+            return await asyncio.to_thread(workspace.workspace_ensure,
+                                           params.get("workspace_id"))
 
         elif command == "workspace_pull":
             return await asyncio.to_thread(
                 workspace.workspace_pull,
                 params.get("files") or [],
                 params.get("timeout", 300),
+                params.get("workspace_id"),
             )
 
         elif command == "workspace_scan":
             return await asyncio.to_thread(
                 workspace.workspace_scan,
                 params.get("include_sha256", True),
+                params.get("workspace_id"),
             )
 
         elif command == "workspace_push":
@@ -525,6 +528,7 @@ class ShellBridgeClient:
                 workspace.workspace_push,
                 params.get("files") or [],
                 params.get("timeout", 300),
+                params.get("workspace_id"),
             )
 
         elif command == "env_info":

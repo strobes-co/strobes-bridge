@@ -25,6 +25,35 @@ from strobes_shell_agent.executor import (
 IS_WINDOWS = sys.platform == "win32"
 
 
+def _lane_available() -> bool:
+    """Can this host actually execute a command at all?
+
+    Execution goes through the egress sandbox, and there is deliberately no
+    unsandboxed fallback: a host with no usable backend refuses to run
+    commands rather than running them with unrestricted network access. That
+    is the product behaviour, not a defect, so on such a host these tests have
+    nothing to assert about exit codes and timeouts.
+
+    CI runners are exactly that host. bubblewrap is installed but unprivileged
+    user namespaces are not permitted, and an un-provisioned Windows runner has
+    had no `sandbox-setup`. Skipping is the honest outcome; asserting success
+    would only be asking the sandbox to stop sandboxing.
+    """
+    from strobes_shell_agent import l3lane, procsandbox
+    return l3lane.available() or procsandbox.available()
+
+
+#: Applied per-test rather than to the module, so the pure-unit tests around it
+#: (windows_shell_compat, read/write/list, file_pull/file_push) keep running on
+#: every platform -- they need no lane, and losing them to a blanket skip would
+#: quietly halve this file's coverage on CI.
+needs_lane = pytest.mark.skipif(
+    not _lane_available(),
+    reason="no usable execution lane on this host (no sandbox backend); "
+           "the executor refuses to run commands unsandboxed by design",
+)
+
+
 # ---------------------------------------------------------------------------
 # Windows shell compatibility
 #
@@ -138,6 +167,7 @@ class TestWindowsShellCompat:
         assert windows_shell_compat("echo hi") == "echo hi"
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_shell_success():
     r = await execute_shell_command("echo hello", timeout=5)
@@ -146,6 +176,7 @@ async def test_shell_success():
     assert r["exit_code"] == 0
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_shell_failure_exit_code():
     cmd = "exit 7" if not IS_WINDOWS else "exit /b 7"
@@ -154,6 +185,7 @@ async def test_shell_failure_exit_code():
     assert r["exit_code"] == 7
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_shell_timeout():
     """Timeout must kill the parent and any children it spawned."""
@@ -170,6 +202,7 @@ async def test_shell_timeout():
     assert elapsed < 5
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_shell_kills_grandchildren():
     """When the shell forks a child, the timeout must reap the child too."""
@@ -187,6 +220,7 @@ async def test_shell_kills_grandchildren():
             os.kill(int(pid_str), 0)
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_execute_code_python():
     r = await execute_code("python", "print(2+2)", timeout=10)
@@ -194,6 +228,7 @@ async def test_execute_code_python():
     assert "4" in r["stdout"]
 
 
+@needs_lane
 @pytest.mark.asyncio
 async def test_execute_code_handles_missing_cwd(tmp_path):
     """If cwd is bogus, we still run (in default cwd) instead of crashing."""

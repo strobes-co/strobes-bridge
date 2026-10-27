@@ -98,8 +98,12 @@ STROBES_BRIDGE_ID=your-bridge-id
 STROBES_SHELL_NAME=my-server
 EOF
 
-docker run --rm --env-file .env ghcr.io/strobes-co/strobes-bridge:latest connect
+docker run --rm --cap-add NET_ADMIN --env-file .env ghcr.io/strobes-co/strobes-bridge:latest connect
 ```
+
+`--cap-add NET_ADMIN` lets the bridge load the nftables rules that confine AI-issued
+commands (the egress sandbox). Without it the bridge stays connected but **refuses
+to run commands**. Check with `docker exec <container> strobes-shell-agent sandbox-check`.
 
 **Option D: Docker Compose**
 
@@ -108,6 +112,8 @@ cp .env.example .env
 # Edit .env with your values
 docker compose up -d
 ```
+
+The bundled `docker-compose.yaml` already adds `NET_ADMIN` for the egress sandbox.
 
 **Option E: From source (development)**
 
@@ -219,7 +225,7 @@ docker build -t strobes/shell-agent .
 ### Run
 
 ```bash
-docker run --rm --env-file .env strobes/shell-agent connect
+docker run --rm --cap-add NET_ADMIN --env-file .env strobes/shell-agent connect
 ```
 
 ### Docker Compose
@@ -230,6 +236,8 @@ services:
     image: ghcr.io/strobes-co/strobes-bridge:latest
     env_file: .env
     restart: unless-stopped
+    cap_add:
+      - NET_ADMIN  # egress sandbox (nftables); without it commands are refused
     volumes:
       - ./workspace:/workspace  # Optional: mount files into the agent
 ```

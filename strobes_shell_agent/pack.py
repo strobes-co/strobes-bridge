@@ -416,6 +416,19 @@ def _extract_bundled(bundled: Path, replace: bool = False) -> bool:
 
 
 def ensure_pack(download: bool = True, timeout: int = 300) -> Optional[Path]:
+    """Make a pack available and return its path (or None); see :func:`_ensure_pack`.
+
+    A pack that arrives here may need sharing with the account commands run as
+    (see :func:`share_with`) -- the lane can start before the first pack lands.
+    """
+    found = _ensure_pack(download, timeout)
+    if found is None:
+        return None
+    reshare()
+    return find_pack()
+
+
+def _ensure_pack(download: bool = True, timeout: int = 300) -> Optional[Path]:
     """Make a pack available and return its path (or None). Order, DEFAULT IS OFFLINE:
       1. already present AND current → use it, no network;
       1b. present but a NEWER pack is embedded in this binary → refresh from it;
@@ -570,6 +583,9 @@ def update_pack(base_url: Optional[str] = None, expected_version: Optional[str] 
     if not _download_pack(base_url, root, timeout):
         return None
     _reset_caches()
+    # Before the version check: with a shared copy pinned, the version read
+    # would otherwise come from the copy, i.e. the old pack.
+    reshare()
     if expected_version and installed_version() != expected_version:
         log.error("update_pack: after pull, version is %s (wanted %s)",
                   installed_version(), expected_version)
@@ -623,3 +639,126 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
         tar.extractall(dest, filter="data")
     else:
         tar.extractall(dest)  # noqa: S202 (validated above)
+
+
+# ---------------------------------------------------------------------------
+# Sharing the pack with the account commands run as
+# ---------------------------------------------------------------------------
+
+#: Where a pack is copied when commands run as an account that cannot reach the
+#: one in use. Root-owned and world-traversable: it holds tools, not secrets.
+SHARED_ROOT = Path("/opt/strobes-shell-agent/pack")
+
+#: The uid the pack was last shared with and the copy pinned for it, so an
+#: update can refresh the copy instead of leaving commands on the old version.
+_shared: dict = {"uid": None, "pin": None}
+
+
+def _reachable_by(path: Path, uid: int) -> bool:
+    """Can ``uid`` traverse every directory down to ``path``?
+
+    Checked from the mode bits rather than with ``os.access``, which answers for
+    the caller's identity, not for the account the command will run as.
+    """
+    import stat as _stat
+
+    for p in [path, *path.parents]:
+        try:
+            st = p.stat()
+        except OSError:
+            return False
+        if st.st_uid == uid:
+            if not st.st_mode & _stat.S_IXUSR:
+                return False
+        elif not st.st_mode & _stat.S_IXOTH:
+            return False
+    return True
+
+
+def _open_up(root: Path) -> None:
+    """Directories 0755, files readable by all and executable where they were."""
+    import stat as _stat
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        os.chmod(dirpath, 0o755)
+        for name in filenames:
+            fp = os.path.join(dirpath, name)
+            if os.path.islink(fp):
+                continue
+            mode = os.stat(fp).st_mode
+            extra = _stat.S_IRGRP | _stat.S_IROTH
+            if mode & _stat.S_IXUSR:
+                extra |= _stat.S_IXGRP | _stat.S_IXOTH
+            os.chmod(fp, (mode | extra) & 0o7777 & ~(_stat.S_IWGRP | _stat.S_IWOTH))
+
+
+#: Dropped into the shared copy's site-packages. The pack keeps user site off
+#: (PYTHONNOUSERSITE) so a stale user-site SDK cannot shadow its own; but the
+#: account commands run as cannot write the shared copy, so whatever it
+#: installs with ``pip install --user`` -- the connect-time playwright install,
+#: an agent's own packages -- was unimportable. Appending the account's user
+#: site AFTER everything else keeps the pack's packages first and makes the
+#: account's own extras visible.
+_USER_SITE_PTH = "zz-strobes-lane-user-site.pth"
+_USER_SITE_LINE = (
+    "import os, site, sys; site.addsitedir(os.path.join(os.path.expanduser('~'), "
+    "'.local', 'lib', 'python%d.%d' % sys.version_info[:2], 'site-packages'))\n"
+)
+
+
+def _add_user_site_hook(pack_dir: Path) -> None:
+    for sp in pack_dir.glob("python/*/lib/python3*/site-packages"):
+        (sp / _USER_SITE_PTH).write_text(_USER_SITE_LINE)
+        os.chmod(sp / _USER_SITE_PTH, 0o644)
+
+
+def share_with(uid: int) -> Optional[Path]:
+    """Make the pack usable by ``uid``, and return the pack commands should use.
+
+    A pack kept under the bridge user's home (the default cache) or extracted by
+    PyInstaller into its private temp dir is unreachable to a separate account,
+    so in the packet-filter lane every pack tool failed with "Permission
+    denied". When that is the case the pack is copied once per version into
+    :data:`SHARED_ROOT` and pinned via ``STROBES_PACK_PATH`` so every later
+    lookup -- PATH, the pack interpreter, capabilities -- resolves to the copy.
+    """
+    # Remembered even when there is nothing to share yet, so a pack that lands
+    # after the lane started is shared on arrival.
+    _shared["uid"] = uid
+    # Look past our own pin: the source is the pack the bridge provisioned.
+    if _shared["pin"] and os.environ.get(PACK_PATH_ENV) == _shared["pin"]:
+        os.environ.pop(PACK_PATH_ENV, None)
+        _reset_caches()
+    src = find_pack()
+    if src is None or _reachable_by(src, uid):
+        return src
+    dst = SHARED_ROOT / src.name
+    try:
+        if _manifest(dst) != _manifest(src) or not _is_pack(dst):
+            SHARED_ROOT.mkdir(parents=True, exist_ok=True)
+            for p in [SHARED_ROOT, *SHARED_ROOT.parents][:2]:
+                os.chmod(p, 0o755)
+            tmp = Path(tempfile.mkdtemp(prefix=".share-", dir=SHARED_ROOT))
+            staged = tmp / src.name
+            shutil.copytree(src, staged, symlinks=True)
+            _open_up(staged)
+            if dst.exists():
+                shutil.rmtree(dst)
+            os.replace(staged, dst)
+            shutil.rmtree(tmp, ignore_errors=True)
+            log.info("pack shared for uid %s at %s", uid, dst)
+        # Every time, not only on copy: copies made before the hook existed.
+        _add_user_site_hook(dst)
+    except OSError as e:
+        log.warning("could not share the pack at %s: %s", dst, e)
+        return src
+    os.environ[PACK_PATH_ENV] = str(dst)
+    _shared.update(uid=uid, pin=str(dst))
+    _reset_caches()
+    return dst
+
+
+def reshare() -> None:
+    """Refresh the shared copy after the pack changed. No-op if never shared."""
+    if _shared["uid"] is not None:
+        share_with(_shared["uid"])

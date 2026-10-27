@@ -14,6 +14,12 @@ services:
       # Persist bridge_id (and any runtime state) across restarts
       - state:/root/.strobes-shell-agent
     restart: unless-stopped
+    # Lets the bridge load its nftables egress rules -- the sandbox that confines
+    # AI-issued commands. Without it (and without a usable bubblewrap) the bridge
+    # refuses to run commands. Check with:
+    #   docker compose exec shell-agent strobes-shell-agent sandbox-check
+    cap_add:
+      - NET_ADMIN
     # Override CMD if you need extra flags
     # command: ["connect", "--verbose"]
 

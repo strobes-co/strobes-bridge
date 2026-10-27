@@ -22,7 +22,46 @@ def _home(tmp_path, monkeypatch):
     """A throwaway HOME, so tests never touch the real ~/.strobes."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # The workspace lives in the home COMMANDS see, which on a root host with
+    # nftables is the scan account's, not the bridge's. Pin it so these tests
+    # do not depend on the privileges of whoever runs them.
+    from strobes_shell_agent import sandbox
+
+    monkeypatch.setattr(sandbox, "command_home", lambda: str(tmp_path))
     return tmp_path
+
+
+@pytest.fixture
+def net(monkeypatch):
+    """A fake presigned transport for both code paths: the descriptor-based one
+    (workspace._download/_upload) and the path-based one (executor.file_*).
+    A URL containing "bad" fails; a GET returns b"body:" + url."""
+    sent = []
+
+    def download(url, timeout):
+        if "bad" in url:
+            raise OSError("boom")
+        yield b"body:" + url.encode()
+
+    def upload(url, data, ct, timeout):
+        sent.append(data)
+        return 200
+
+    def file_pull(path, url, sha, timeout):
+        if "bad" in url:
+            return {"success": False, "error": "boom"}
+        Path(path).write_bytes(b"body:" + url.encode())
+        return {"success": True}
+
+    def file_push(path, url, ct, timeout):
+        sent.append(Path(path).read_bytes())
+        return {"success": True}
+
+    monkeypatch.setattr(workspace, "_download", download)
+    monkeypatch.setattr(workspace, "_upload", upload)
+    monkeypatch.setattr("strobes_shell_agent.executor.file_pull", file_pull)
+    monkeypatch.setattr("strobes_shell_agent.executor.file_push", file_push)
+    return sent
 
 
 def _write(root: Path, rel: str, data: bytes = b"x") -> Path:
@@ -109,26 +148,16 @@ class TestPull:
         assert r["skipped"] == 1 and r["pulled"] == 0
         assert calls == [], "an unchanged file was re-downloaded"
 
-    def test_refetches_when_the_checksum_differs(self, monkeypatch):
+    def test_refetches_when_the_checksum_differs(self, net):
         workspace.workspace_ensure()
         _write(workspace.workspace_root(), "a.txt", b"stale")
-        monkeypatch.setattr(
-            "strobes_shell_agent.executor.file_pull",
-            lambda *a, **k: {"success": True},
-        )
-        r = workspace.workspace_pull(
-            [{"path": "a.txt", "url": "https://x/y", "sha256": "0" * 64}]
-        )
+        r = workspace.workspace_pull([{"path": "a.txt", "url": "https://x/y"}])
         assert r["pulled"] == 1 and r["skipped"] == 0
+        assert (workspace.workspace_root() / "a.txt").read_bytes() == b"body:https://x/y"
 
-    def test_one_bad_url_does_not_cost_the_others(self, monkeypatch):
+    def test_one_bad_url_does_not_cost_the_others(self, net):
         """The agent may only need the file that worked."""
         workspace.workspace_ensure()
-
-        def fake(path, url, sha, timeout):
-            return {"success": "good" in url, "error": "boom"}
-
-        monkeypatch.setattr("strobes_shell_agent.executor.file_pull", fake)
         r = workspace.workspace_pull([
             {"path": "ok.txt", "url": "https://good/1"},
             {"path": "bad.txt", "url": "https://bad/2"},
@@ -148,12 +177,8 @@ class TestPull:
         assert r["pulled"] == 0 and len(r["failed"]) == 1
         assert not (_home / "pwned.txt").exists()
 
-    def test_creates_intermediate_directories(self, monkeypatch):
+    def test_creates_intermediate_directories(self, net):
         workspace.workspace_ensure()
-        monkeypatch.setattr(
-            "strobes_shell_agent.executor.file_pull",
-            lambda *a, **k: {"success": True},
-        )
         workspace.workspace_pull([{"path": "reports/2026/a.pdf", "url": "https://x/y"}])
         assert (workspace.workspace_root() / "reports" / "2026").is_dir()
 
@@ -188,18 +213,13 @@ class TestScan:
 
 
 class TestPush:
-    def test_only_pushes_what_the_backend_named(self, monkeypatch):
+    def test_only_pushes_what_the_backend_named(self, net):
         """The machine never decides what leaves it."""
         workspace.workspace_ensure()
-        _write(workspace.workspace_root(), "wanted.txt")
-        _write(workspace.workspace_root(), "private.txt")
-        pushed = []
-        monkeypatch.setattr(
-            "strobes_shell_agent.executor.file_push",
-            lambda path, url, ct, to: pushed.append(Path(path).name) or {"success": True},
-        )
+        _write(workspace.workspace_root(), "wanted.txt", b"wanted")
+        _write(workspace.workspace_root(), "private.txt", b"private")
         r = workspace.workspace_push([{"path": "wanted.txt", "url": "https://x/y"}])
-        assert r["pushed"] == 1 and pushed == ["wanted.txt"]
+        assert r["pushed"] == 1 and net == [b"wanted"]
 
     def test_refuses_to_push_outside_the_workspace(self, monkeypatch):
         monkeypatch.setattr(
@@ -209,10 +229,7 @@ class TestPush:
         r = workspace.workspace_push([{"path": "../../.ssh/id_rsa", "url": "https://x/y"}])
         assert r["pushed"] == 0 and r["success"] is False
 
-    def test_missing_file_is_reported_not_raised(self, monkeypatch):
+    def test_missing_file_is_reported_not_raised(self, net):
         workspace.workspace_ensure()
-        monkeypatch.setattr(
-            "strobes_shell_agent.executor.file_push", lambda *a, **k: {"success": True}
-        )
         r = workspace.workspace_push([{"path": "nope.txt", "url": "https://x/y"}])
         assert r["failed"][0]["error"] == "not a file on this machine"

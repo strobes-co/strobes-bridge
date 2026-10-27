@@ -31,11 +31,23 @@ LABEL description="Strobes Shell Bridge Agent (with baked-in sandbox pack)"
 WORKDIR /app
 
 # Minimal OS deps only — the security tooling comes from the baked pack, not apt.
+# The egress sandbox is the exception: without a backend the bridge REFUSES every
+# AI-issued command, so the image must carry one.
+#   nftables     the packet-filter lane; needs `--cap-add NET_ADMIN` at run time.
+#                The reliable backend in a container (scanners get correct results).
+#   libcap2-bin  setcap, so the lane's scan account can SYN-scan (CAP_NET_RAW).
+#   bubblewrap   the proxy-lane fallback; only usable where the runtime allows
+#                unprivileged user namespaces (Docker's default seccomp often does
+#                not, and the bridge then reports it as unavailable rather than
+#                pretending).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     git \
     openssh-client \
+    nftables \
+    libcap2-bin \
+    bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml .
