@@ -58,6 +58,15 @@ def triple() -> str:
     m = platform.machine().lower()
     arch = ("x86_64" if m in ("x86_64", "amd64")
             else "aarch64" if m in ("aarch64", "arm64") else m)
+    # No native ARM64 Windows sandbox pack is published (only windows-x86_64).
+    # Windows 11 on ARM runs x86_64 binaries under emulation, including the
+    # pack's bundled standalone interpreter and CLI tools, so an ARM64 Windows
+    # host must request/resolve the x86_64 pack. Mapping here keeps download,
+    # on-disk lookup, the manifest triple and host-python resolution all
+    # consistent. Remove this two-line guard if a native windows-aarch64 pack
+    # is ever published.
+    if os_name == "windows" and arch == "aarch64":
+        arch = "x86_64"
     return f"{os_name}-{arch}"
 
 
