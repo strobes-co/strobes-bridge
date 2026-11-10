@@ -276,8 +276,14 @@ class ResolvedPolicy:
         # machine — every local service and debug port — so reaching it must be
         # asked for by a rule, exactly as in the proxy lane. DNS below is the
         # one exception, because a hostname scope is unusable without it.
-        lines.append(f"    udp dport {_DNS_PORT} accept")
-        lines.append(f"    tcp dport {_DNS_PORT} accept")
+        # Match DNS on the conntrack ORIGINAL destination port, not the
+        # packet's. Docker's embedded resolver (127.0.0.11) is reached through
+        # a `nat OUTPUT` DNAT to a random high port, which runs at dstnat
+        # priority -- BEFORE this filter hook -- so `udp dport 53` never
+        # matched there and an enforced scope broke every name lookup,
+        # in-scope ones included (measured on a containerised bridge:
+        # "Temporary failure in name resolution" for an allowed host).
+        lines.append(f"    meta l4proto {{ tcp, udp }} ct original proto-dst {_DNS_PORT} accept")
         # Hard denies ahead of every allow — deny wins.
         for c in deny4:
             lines.append(f"    ip daddr {c} reject")

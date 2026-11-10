@@ -104,7 +104,9 @@ def test_nftables_does_not_carve_out_loopback():
     assert "127.0.0.0/8 accept" not in nft
     assert 'oif "lo" accept' not in nft
     # DNS is the one exception, or a hostname scope cannot resolve.
-    assert "udp dport 53 accept" in nft
+    # DNS is matched pre-NAT (conntrack original port): Docker DNATs :53.
+    assert "meta l4proto { tcp, udp } ct original proto-dst 53 accept" in nft
+    assert "udp dport 53 accept" not in nft
 
 
 def test_nftables_hard_denies_metadata_before_allow():
