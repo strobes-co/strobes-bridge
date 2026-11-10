@@ -510,8 +510,9 @@ def describe_policy() -> dict:
     p = _current_policy()
     return {
         "default_egress": p.default_egress,
-        "allow": [e.value for e in p.allow],
-        "deny": [e.value for e in p.deny],
+        # Ports shown as written: "host:8099" is a narrower scope than "host".
+        "allow": [e.value + (":" + ",".join(map(str, sorted(e.ports))) if e.ports else "") for e in p.allow],
+        "deny": [e.value + (":" + ",".join(map(str, sorted(e.ports))) if e.ports else "") for e in p.deny],
         "block_metadata": p.block_metadata,
         "enforced": not p.is_open,
         "mode": _lane.mode if _lane is not None else (

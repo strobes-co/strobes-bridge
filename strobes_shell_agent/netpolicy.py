@@ -78,6 +78,21 @@ def classify(value: str) -> Kind:
         return "host"
 
 
+def _port_of(value: str) -> int:
+    """The explicit port in ``host:443`` / ``https://host:8443/x`` / ``10.0.0.0/8:22``."""
+    v = value.strip()
+    if "://" in v:
+        v = v.split("://", 1)[1].split("/", 1)[0]
+    if v.startswith("["):  # [v6]:port
+        tail = v.rsplit("]", 1)[-1]
+        v = tail[1:] if tail.startswith(":") else ""
+        return int(v) if v.isdigit() else 0
+    if v.count(":") == 1:
+        p = v.rsplit(":", 1)[1]
+        return int(p) if p.isdigit() and 0 < int(p) < 65536 else 0
+    return 0
+
+
 def _strip_to_host(value: str) -> str:
     """Reduce a user entry to a bare host/ip/cidr token.
 
@@ -91,8 +106,10 @@ def _strip_to_host(value: str) -> str:
         v = v.split("/", 1)[0]
     # Strip a :port suffix only for a bare host:port (single colon, no CIDR
     # slash, not an IPv6 literal which carries several colons).
-    if "/" not in v and v.count(":") == 1:
+    if v.count(":") == 1:  # host:port, or a CIDR followed by :port
         v = v.split(":", 1)[0]
+    if v.startswith("[") and "]" in v:
+        v = v[1:].split("]", 1)[0]
     return v.rstrip(".")
 
 
@@ -111,7 +128,16 @@ class Entry:
 
     @classmethod
     def parse(cls, raw: str, ports: Iterable[int] = (), proto: Optional[str] = None) -> "Entry":
+        # A port written in the entry is KEPT. Stripping it silently widened
+        # "host.docker.internal:8099" to every port of that host -- measured:
+        # a second lab on :8101 was reachable under a scope naming only :8099.
+        ports = set(ports or ())
+        port = _port_of(raw)
+        if port:
+            ports.add(port)
         token = _strip_to_host(raw)
+        if token.startswith("*."):
+            token = token[1:]
         kind = classify(token)
         return cls(kind=kind, value=token, ports=frozenset(ports), proto=proto)  # type: ignore[arg-type]
 
@@ -169,20 +195,29 @@ class NetworkPolicy:
         resolver = resolver or Resolver()
         allow_ips: set[str] = set()
         deny_ips: set[str] = set()
+        allow_ports: dict[str, set[int]] = {}
         unresolved: list[str] = []
 
-        for bucket, sink in ((self.allow, allow_ips), (self.deny, deny_ips)):
-            for e in bucket:
-                if e.kind == "cidr":
-                    sink.add(e.value)
-                elif e.kind == "ip":
-                    sink.add(_as_host_cidr(e.value))
-                else:  # host
-                    addrs = resolver.resolve(e.value)
-                    if not addrs:
-                        unresolved.append(e.value)
-                    for a in addrs:
-                        sink.add(_as_host_cidr(a))
+        def cidrs_of(e):
+            if e.kind == "cidr":
+                return [e.value]
+            if e.kind == "ip":
+                return [_as_host_cidr(e.value)]
+            addrs = resolver.resolve(e.value)
+            if not addrs:
+                unresolved.append(e.value)
+            return [_as_host_cidr(a) for a in addrs]
+
+        for e in self.allow:
+            for c in cidrs_of(e):
+                if e.ports:  # narrowed: only these ports on this address
+                    allow_ports.setdefault(c, set()).update(e.ports)
+                else:
+                    allow_ips.add(c)
+        # A deny is never narrowed by its port at L3: denying the whole
+        # address is the safe direction for a rule meant to subtract access.
+        for e in self.deny:
+            deny_ips.update(cidrs_of(e))
 
         return ResolvedPolicy(
             source=self,
@@ -190,6 +225,8 @@ class NetworkPolicy:
             deny_cidrs=frozenset(deny_ips),
             unresolved=tuple(unresolved),
             resolved_at=time.time(),
+            allow_port_rules=tuple(sorted((c, tuple(sorted(p))) for c, p in allow_ports.items()
+                                          if c not in allow_ips)),
         )
 
 
@@ -213,6 +250,8 @@ class ResolvedPolicy:
     deny_cidrs: frozenset[str]
     unresolved: tuple[str, ...]
     resolved_at: float
+    #: ``(cidr, ports)`` for allow entries narrowed to ports.
+    allow_port_rules: tuple = ()
 
     def hard_denied_cidrs(self) -> tuple[str, ...]:
         """Ranges pinned shut before any allow rule (metadata, link-local, +user denies)."""
@@ -293,6 +332,10 @@ class ResolvedPolicy:
             lines.append("    ip daddr @allow4 accept")
         if allow6:
             lines.append("    ip6 daddr @allow6 accept")
+        for cidr, ports in self.allow_port_rules:
+            fam = "ip6" if ":" in cidr else "ip"
+            plist = ", ".join(str(p) for p in ports)
+            lines.append(f"    {fam} daddr {cidr} meta l4proto {{ tcp, udp }} th dport {{ {plist} }} accept")
         lines.append(f"    {default}")
         lines.append("  }")
         lines.append("}")

@@ -129,3 +129,31 @@ def test_nftables_ipv6_set_separate():
     assert "set allow6" in nft
     assert "set allow4" in nft
     assert "ip6 daddr @allow6 accept" in nft
+
+
+def test_port_in_entry_is_kept_not_widened():
+    """'host:8099' used to become 'host' (every port) -- a second lab on :8101
+    was reachable under a scope that named only :8099."""
+    p = NetworkPolicy.from_lists(allow=["10.1.2.3:8099", "https://app.example:8443/x", "*.acme.test"])
+    assert p.allow[0].ports == frozenset({8099})
+    assert p.allow[1].value == "app.example" and p.allow[1].ports == frozenset({8443})
+    assert p.allow[2].value == ".acme.test"
+
+
+def test_proxy_lane_honours_entry_ports():
+    from strobes_shell_agent.netpolicy import Checker
+
+    class R:
+        def resolve(self, h):
+            return ("10.9.9.9",)
+
+    c = Checker(NetworkPolicy.from_lists(allow=["lab.test:8099"]), resolver=R())
+    assert c.check("lab.test", 8099).allowed
+    assert not c.check("lab.test", 8101).allowed
+
+
+def test_nftables_narrows_port_scoped_allows():
+    nft = NetworkPolicy.from_lists(allow=["1.2.3.4:8099", "5.6.7.8"]).resolve().to_nftables(uid=1500)
+    assert "ip daddr 1.2.3.4/32 meta l4proto { tcp, udp } th dport { 8099 } accept" in nft
+    assert "1.2.3.4/32" not in nft.split("set allow4", 1)[1].split("}", 1)[0]
+    assert "5.6.7.8/32" in nft
