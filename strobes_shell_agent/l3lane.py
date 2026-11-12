@@ -205,7 +205,8 @@ def apply_policy(policy: NetworkPolicy, uid: Optional[int] = None) -> dict:
     return {
         "uid": uid,
         "table": TABLE,
-        "allow": sorted(resolved.allow_cidrs),
+        "allow": sorted(resolved.allow_cidrs)
+        + [f"{c} ports {','.join(map(str, p))}" for c, p in resolved.allow_port_rules],
         "unresolved": list(resolved.unresolved),
         "default_egress": policy.default_egress,
     }
