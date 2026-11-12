@@ -35,6 +35,10 @@ import hashlib
 import logging
 import os
 import sys
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -854,3 +858,108 @@ def _workspace_push_fd(files, timeout, workspace_id) -> Dict[str, Any]:
     finally:
         os.close(root_fd)
     return {"success": not failed, "pushed": pushed, "failed": failed}
+
+
+# ---------------------------------------------------------------------------
+# Background push: the platform hands over the upload list and moves on
+# ---------------------------------------------------------------------------
+
+#: Uploads one background job runs at once. Each is a presigned PUT straight
+#: to object storage, so the limit is the machine's uplink, not the platform.
+BG_PUSH_WORKERS = 8
+
+#: How long a finished job's result stays readable, for the platform to poll.
+BG_JOB_TTL_SECONDS = 3600
+
+_bg_lock = threading.Lock()
+_bg_jobs: Dict[str, Dict[str, Any]] = {}
+#: (workspace id, path) uploads queued or running in any job. A second job
+#: naming a file already on its way skips it rather than uploading it twice.
+_bg_inflight: set = set()
+
+
+def _bg_prune(now: float) -> None:
+    for job_id in [j for j, job in _bg_jobs.items()
+                   if job["done"] and now - job["finished_at"] > BG_JOB_TTL_SECONDS]:
+        _bg_jobs.pop(job_id, None)
+
+
+def workspace_push_start(files: List[Dict[str, Any]], timeout: int = 300,
+                         workspace_id: Optional[str] = None) -> Dict[str, Any]:
+    """Start pushing named workspace files in the background; return at once.
+
+    Same contract as :func:`workspace_push` -- the backend names every file and
+    its presigned PUT, this never chooses -- but the uploads run on a worker
+    pool after the reply, so a large write never holds up the platform or the
+    commands that follow it. Poll :func:`workspace_push_status` with the
+    returned ``job_id``.
+    """
+    ws_key = workspace_id or ""
+    todo: List[Dict[str, Any]] = []
+    skipped = 0
+    now = time.time()
+    with _bg_lock:
+        _bg_prune(now)
+        for entry in files or []:
+            key = (ws_key, (entry or {}).get("path") or "")
+            if key in _bg_inflight:
+                skipped += 1
+                continue
+            _bg_inflight.add(key)
+            todo.append(entry)
+        job_id = uuid.uuid4().hex
+        job = {"total": len(todo), "pushed": 0, "failed": [], "skipped": skipped,
+               "done": not todo, "started_at": now,
+               "finished_at": now if not todo else 0.0}
+        _bg_jobs[job_id] = job
+    if todo:
+        try:
+            threading.Thread(target=_bg_run, args=(job, todo, timeout, workspace_id),
+                             name=f"workspace-push-{job_id[:8]}", daemon=True).start()
+        except Exception as e:  # noqa: BLE001 -- no thread, no job
+            _bg_finish(job, todo, ws_key)
+            return {"success": False, "error": f"could not start push: {e}"}
+    return {"success": True, "job_id": job_id, "queued": len(todo), "skipped": skipped}
+
+
+def _bg_finish(job: Dict[str, Any], todo: List[Dict[str, Any]], ws_key: str) -> None:
+    with _bg_lock:
+        for entry in todo:
+            _bg_inflight.discard((ws_key, (entry or {}).get("path") or ""))
+        job["done"] = True
+        job["finished_at"] = time.time()
+
+
+def _bg_run(job: Dict[str, Any], todo: List[Dict[str, Any]], timeout: int,
+            workspace_id: Optional[str]) -> None:
+    ws_key = workspace_id or ""
+
+    def _one(entry: Dict[str, Any]) -> None:
+        rel = (entry or {}).get("path") or ""
+        try:
+            result = workspace_push([entry], timeout, workspace_id)
+        except Exception as e:  # noqa: BLE001 -- one file never sinks the job
+            result = {"pushed": 0, "failed": [{"path": rel, "error": str(e)}]}
+        with _bg_lock:
+            _bg_inflight.discard((ws_key, rel))
+            job["pushed"] += result.get("pushed") or 0
+            job["failed"].extend(result.get("failed") or [])
+
+    try:
+        with ThreadPoolExecutor(max_workers=BG_PUSH_WORKERS) as pool:
+            list(pool.map(_one, todo))
+    finally:
+        _bg_finish(job, todo, ws_key)
+        log.info("workspace background push: pushed=%s failed=%s of %s",
+                 job["pushed"], len(job["failed"]), job["total"])
+
+
+def workspace_push_status(job_id: str) -> Dict[str, Any]:
+    """Progress of a background push started by :func:`workspace_push_start`."""
+    with _bg_lock:
+        job = _bg_jobs.get(job_id or "")
+        if job is None:
+            return {"success": False, "error": "unknown job", "done": True}
+        return {"success": True, "job_id": job_id, "done": job["done"],
+                "total": job["total"], "pushed": job["pushed"],
+                "failed": list(job["failed"]), "skipped": job["skipped"]}
