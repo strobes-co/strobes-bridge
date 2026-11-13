@@ -189,7 +189,7 @@ class ShellBridgeClient:
                 "agent_version": AGENT_VERSION,
                 "pack": pack.status(),
                 # Capabilities the platform can rely on for this daemon.
-                "features": ["bg_exec", "workspace_homes"],
+                "features": ["bg_exec", "workspace_homes", "workspace_bg_push"],
             },
         }))
 
@@ -530,6 +530,18 @@ class ShellBridgeClient:
                 params.get("timeout", 300),
                 params.get("workspace_id"),
             )
+
+        elif command == "workspace_push_start":
+            # Returns at once; the uploads run on a worker pool afterwards.
+            return await asyncio.to_thread(
+                workspace.workspace_push_start,
+                params.get("files") or [],
+                params.get("timeout", 300),
+                params.get("workspace_id"),
+            )
+
+        elif command == "workspace_push_status":
+            return workspace.workspace_push_status(params.get("job_id") or "")
 
         elif command == "env_info":
             return get_env_info()

@@ -233,3 +233,109 @@ class TestPush:
         workspace.workspace_ensure()
         r = workspace.workspace_push([{"path": "nope.txt", "url": "https://x/y"}])
         assert r["failed"][0]["error"] == "not a file on this machine"
+
+
+def _wait_done(job_id, limit=10.0):
+    import time
+
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        st = workspace.workspace_push_status(job_id)
+        if st["done"]:
+            return st
+        time.sleep(0.02)
+    pytest.fail("background push never finished")
+
+
+class TestBackgroundPush:
+    def test_returns_before_uploading_and_pushes_everything(self, net, monkeypatch):
+        """The reply must not wait for the uploads -- that wait is what made
+        every command behind a big write take 20-30s."""
+        import threading
+
+        gate = threading.Event()
+        real = workspace._upload
+
+        def slow(url, data, ct, timeout):
+            gate.wait(5)
+            return real(url, data, ct, timeout)
+
+        monkeypatch.setattr(workspace, "_upload", slow)
+        workspace.workspace_ensure()
+        files = []
+        for i in range(30):
+            _write(workspace.workspace_root(), f"out/f{i}.txt", f"data{i}".encode())
+            files.append({"path": f"out/f{i}.txt", "url": f"https://x/{i}"})
+
+        r = workspace.workspace_push_start(files)
+        assert r["success"] and r["queued"] == 30
+        assert workspace.workspace_push_status(r["job_id"])["done"] is False
+        gate.set()
+        st = _wait_done(r["job_id"])
+        assert st["pushed"] == 30 and st["failed"] == []
+        assert sorted(net) == sorted(f"data{i}".encode() for i in range(30))
+
+    def test_a_file_already_on_its_way_is_not_uploaded_twice(self, net, monkeypatch):
+        import threading
+
+        gate = threading.Event()
+        real = workspace._upload
+        monkeypatch.setattr(workspace, "_upload",
+                            lambda *a: (gate.wait(5), real(*a))[1])
+        workspace.workspace_ensure()
+        _write(workspace.workspace_root(), "a.txt", b"A")
+        entry = {"path": "a.txt", "url": "https://x/a"}
+
+        first = workspace.workspace_push_start([entry])
+        second = workspace.workspace_push_start([entry])
+        assert first["queued"] == 1
+        assert second["queued"] == 0 and second["skipped"] == 1
+        assert workspace.workspace_push_status(second["job_id"])["done"] is True
+        gate.set()
+        _wait_done(first["job_id"])
+        assert net == [b"A"]
+        # Once it has landed the path is free again.
+        third = workspace.workspace_push_start([entry])
+        assert third["queued"] == 1
+        _wait_done(third["job_id"])
+
+    def test_failures_are_reported_per_file(self, net):
+        workspace.workspace_ensure()
+        _write(workspace.workspace_root(), "ok.txt", b"ok")
+        r = workspace.workspace_push_start([
+            {"path": "ok.txt", "url": "https://x/ok"},
+            {"path": "missing.txt", "url": "https://x/m"},
+            {"path": "../../.ssh/id_rsa", "url": "https://x/e"},
+        ])
+        st = _wait_done(r["job_id"])
+        assert st["pushed"] == 1
+        assert sorted(f["path"] for f in st["failed"]) == ["../../.ssh/id_rsa", "missing.txt"]
+
+    def test_uploads_run_in_parallel(self, net, monkeypatch):
+        import threading
+        import time
+
+        active, peak, lock = [0], [0], threading.Lock()
+        real = workspace._upload
+
+        def track(*a):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            return real(*a)
+
+        monkeypatch.setattr(workspace, "_upload", track)
+        workspace.workspace_ensure()
+        files = []
+        for i in range(24):
+            _write(workspace.workspace_root(), f"p{i}", b"x")
+            files.append({"path": f"p{i}", "url": f"https://x/{i}"})
+        _wait_done(workspace.workspace_push_start(files)["job_id"])
+        assert peak[0] > 1
+
+    def test_unknown_job(self):
+        st = workspace.workspace_push_status("nope")
+        assert st["success"] is False and st["done"] is True
