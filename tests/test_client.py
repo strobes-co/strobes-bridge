@@ -183,3 +183,40 @@ async def test_failed_agent_update_not_retried(monkeypatch):
     for _ in range(3):
         await c._apply_updates({"required_agent_version": "99.0.0"})
     assert calls == ["99.0.0"]
+
+
+@pytest.mark.asyncio
+async def test_large_manifest_is_received_and_close_reason_logged(caplog):
+    """A >10MB platform message (a 2000-file push manifest) used to make the
+    client close with 1009, logged only as 'code=1006 reason='''."""
+    from strobes_shell_agent import client as client_mod
+
+    got = []
+    big = json.dumps({"type": "pong", "pad": "x" * 12_000_000})
+
+    async def handler(ws):
+        await ws.recv()  # identify
+        await ws.send(big)
+        await ws.close(code=4000, reason="done")
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        c = ShellBridgeClient(
+            url=f"http://127.0.0.1:{port}",
+            api_key="K", org_id="O", bridge_id="B", name="x",
+        )
+        orig = c._message_handler
+
+        async def handler_once():
+            await orig()
+            got.append(True)
+            c.stop()
+
+        c._message_handler = handler_once
+        with caplog.at_level("INFO"):
+            await asyncio.wait_for(c.connect_forever(), timeout=15)
+
+    assert got
+    assert "received=4000 'done'" in caplog.text
+    assert "1009" not in caplog.text
+    assert client_mod.MAX_MESSAGE_SIZE > 12_000_000
