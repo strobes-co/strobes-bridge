@@ -684,14 +684,20 @@ def file_push(path: str, url: str, content_type: str = "application/octet-stream
             return {"success": False, "error": f"File not found: {path}"}
         if not p.is_file():
             return {"success": False, "error": f"Not a file: {path}"}
-        data = p.read_bytes()
-        sha256 = hashlib.sha256(data).hexdigest()
-        req = urllib.request.Request(url, data=data, method="PUT")
-        req.add_header("Content-Type", content_type)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            code = r.status
-        return {"success": True, "path": str(p), "size": len(data),
-                "sha256": sha256, "status": code}
+        # Streamed, not read into memory: a workspace file can be up to 2 GB.
+        from .workspace import _Bounded
+
+        h = hashlib.sha256()
+        with p.open("rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            body = _Bounded(fh, size, sha=h)
+            req = urllib.request.Request(url, data=body, method="PUT")
+            req.add_header("Content-Type", content_type)
+            req.add_header("Content-Length", str(size))
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                code = r.status
+        return {"success": True, "path": str(p), "size": size,
+                "sha256": h.hexdigest(), "status": code}
     except urllib.error.HTTPError as e:
         return {"success": False, "error": f"HTTP {e.code} on presigned PUT: {e.reason}"}
     except Exception as e:
