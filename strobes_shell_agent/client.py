@@ -52,6 +52,24 @@ PING_INTERVAL = 30  # seconds
 # overruns -- especially while a pack download shares the link -- and every
 # miss doubles the reconnect backoff.
 OPEN_TIMEOUT = 30  # seconds
+# Largest message accepted from the platform. A workspace_push_start manifest
+# carries a presigned URL per file (up to 2000 files, a few KB each), which
+# overran the old 10MB cap: the library closed the socket with 1009, the
+# platform re-sent the same manifest on reconnect, and the bridge dropped every
+# few seconds forever.
+MAX_MESSAGE_SIZE = 64 * 1024 * 1024
+
+
+def _describe_close(e: ConnectionClosed) -> str:
+    """Both sides of a close. ``e.code`` alone reads 1006 whenever the peer
+    sent no close frame -- including when *we* closed (e.g. 1009 message too
+    big), which hid the real reason."""
+    rcvd = getattr(e, "rcvd", None)
+    sent = getattr(e, "sent", None)
+    parts = []
+    parts.append(f"received={rcvd.code} {rcvd.reason!r}" if rcvd else "received=none")
+    parts.append(f"sent={sent.code} {sent.reason!r}" if sent else "sent=none")
+    return " ".join(parts)
 
 
 class ShellBridgeClient:
@@ -126,7 +144,7 @@ class ShellBridgeClient:
                 logger.info(f"Connecting to {self.url}...")
                 connect_kwargs = {
                     "ping_interval": None,  # We handle pings ourselves
-                    "max_size": 10_485_760,  # 10MB max message
+                    "max_size": MAX_MESSAGE_SIZE,
                     "close_timeout": 5,
                     "open_timeout": OPEN_TIMEOUT,
                 }
@@ -167,7 +185,7 @@ class ShellBridgeClient:
                         if exc:
                             raise exc
             except ConnectionClosed as e:
-                logger.warning(f"Connection closed: {e}")
+                logger.warning(f"Connection closed: {_describe_close(e)}")
                 await close_all_pty()
             except ConnectionRefusedError:
                 logger.error("Connection refused. Check URL and API key.")
@@ -333,7 +351,7 @@ class ShellBridgeClient:
                 else:
                     logger.debug(f"Unknown message type: {msg_type}")
         except ConnectionClosed as e:
-            logger.info(f"WebSocket closed: code={e.code} reason={e.reason!r}")
+            logger.info(f"WebSocket closed: {_describe_close(e)}")
 
     async def _handle_pty_open(self, msg: dict):
         """Handle PTY open request from the platform."""
