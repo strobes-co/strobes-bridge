@@ -316,7 +316,11 @@ class TestBackgroundPush:
         import time
 
         active, peak, lock = [0], [0], threading.Lock()
-        real = workspace._upload
+        # Track workspace_push, which the pool calls per file on every
+        # platform. _upload is only the descriptor-based (POSIX) transport;
+        # Windows pushes through executor.file_push, so tracking _upload
+        # there saw no calls at all.
+        real = workspace.workspace_push
 
         def track(*a):
             with lock:
@@ -327,7 +331,7 @@ class TestBackgroundPush:
                 active[0] -= 1
             return real(*a)
 
-        monkeypatch.setattr(workspace, "_upload", track)
+        monkeypatch.setattr(workspace, "workspace_push", track)
         workspace.workspace_ensure()
         files = []
         for i in range(24):
