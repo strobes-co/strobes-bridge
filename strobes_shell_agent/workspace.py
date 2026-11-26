@@ -241,12 +241,45 @@ def _download(url: str, timeout: int):
         yield from iter(lambda: r.read(256 * 1024), b"")
 
 
-def _upload(url: str, data: bytes, content_type: str, timeout: int) -> int:
-    """A presigned PUT; returns the HTTP status."""
+class _Bounded:
+    """A file read as a stream of exactly ``length`` bytes.
+
+    Lets a presigned PUT send the file in blocks instead of loading it into
+    memory first (files go up to MAX_FILE_BYTES, and a background job runs
+    several at once). Bounded to the size taken when the file was opened, so a
+    file still being written cannot overrun the Content-Length it was signed
+    and sent with.
+    """
+
+    def __init__(self, fh, length: int, sha=None):
+        self._fh = fh
+        self.length = length
+        self._left = length
+        self._sha = sha
+
+    def read(self, n: int = -1) -> bytes:
+        if self._left <= 0:
+            return b""
+        n = self._left if n is None or n < 0 else min(n, self._left)
+        chunk = self._fh.read(n)
+        self._left -= len(chunk)
+        if self._sha is not None:
+            self._sha.update(chunk)
+        return chunk
+
+    def __len__(self) -> int:
+        return self.length
+
+
+def _upload(url: str, data, content_type: str, timeout: int) -> int:
+    """A presigned PUT; returns the HTTP status. ``data`` is bytes or a
+    :class:`_Bounded` stream (sent in blocks with an explicit length)."""
     import urllib.request
 
     req = urllib.request.Request(url, data=data, method="PUT")
     req.add_header("Content-Type", content_type)
+    if isinstance(data, _Bounded):
+        req.add_header("Content-Length", str(data.length))
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
         return r.status
 
@@ -296,11 +329,47 @@ def _pull_into(root_fd: int, parts: List[str], url: str, want: Optional[str],
         os.close(parent)
 
 
+class _Exclude:
+    """What a scan leaves out, as the backend asks (``exclude`` param).
+
+    ``hidden``: dot-named files and folders (``.git``, ``.venv``,
+    ``.DS_Store``). ``dirs``: folder names skipped wherever they appear
+    (``node_modules``, ``__pycache__``). ``repos``: any folder holding a
+    ``.git`` entry, i.e. a cloned repository, skipped whole.
+
+    Pruned while walking, not filtered afterwards: a cloned repo or a
+    dependency tree is thousands of entries the backend would only discard,
+    walked and reported after every command. The default excludes nothing,
+    which is what a backend that does not send ``exclude`` expects.
+    """
+
+    def __init__(self, spec: Optional[Dict[str, Any]] = None):
+        spec = spec if isinstance(spec, dict) else {}
+        self.hidden = bool(spec.get("hidden"))
+        self.dirs = {str(d) for d in (spec.get("dirs") or [])}
+        self.repos = bool(spec.get("repos"))
+        #: Folders left out, reported back so the backend can tell "pruned"
+        #: from "missing here" and not re-send their stored copies.
+        self.pruned: List[str] = []
+
+    def skip_name(self, name: str) -> bool:
+        return self.hidden and name.startswith(".")
+
+    def skip_dir(self, name: str, rel: str, has_git) -> bool:
+        if self.skip_name(name) or name in self.dirs or (self.repos and has_git()):
+            self.pruned.append(rel)
+            return True
+        return False
+
+
 def _scan_fd(dir_fd: int, prefix: str, out: List[Dict[str, Any]],
-             include_sha256: bool) -> None:
+             include_sha256: bool, excl: Optional["_Exclude"] = None) -> None:
     import stat as _stat
 
+    excl = excl or _Exclude()
     for name in sorted(os.listdir(dir_fd)):
+        if excl.skip_name(name):
+            continue
         try:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         except OSError:
@@ -312,7 +381,15 @@ def _scan_fd(dir_fd: int, prefix: str, out: List[Dict[str, Any]],
             except OSError:
                 continue
             try:
-                _scan_fd(sub, rel + "/", out, include_sha256)
+                def _has_git(fd=sub) -> bool:
+                    try:
+                        os.stat(".git", dir_fd=fd, follow_symlinks=False)
+                        return True
+                    except OSError:
+                        return False
+
+                if not excl.skip_dir(name, rel, _has_git):
+                    _scan_fd(sub, rel + "/", out, include_sha256, excl)
             finally:
                 os.close(sub)
         elif _stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
@@ -345,12 +422,12 @@ def _push_from(root_fd: int, parts: List[str], url: str, content_type: str,
     except OSError as e:
         return {"success": False, "error": f"refusing this file: {e}"}
     try:
-        if os.fstat(fd).st_size > MAX_FILE_BYTES:
+        size = os.fstat(fd).st_size
+        if size > MAX_FILE_BYTES:
             return {"success": False, "error": "file exceeds the workspace size limit"}
         with os.fdopen(os.dup(fd), "rb") as fh:
-            data = fh.read()
-        status = _upload(url, data, content_type, timeout)
-        return {"success": True, "size": len(data), "status": status}
+            status = _upload(url, _Bounded(fh, size), content_type, timeout)
+        return {"success": True, "size": size, "status": status}
     except urllib.error.HTTPError as e:
         return {"success": False, "error": f"HTTP {e.code} on presigned PUT: {e.reason}"}
     except Exception as e:  # noqa: BLE001
@@ -455,6 +532,21 @@ def _lane_push(root: str, rel: str, url: str, content_type: str, timeout: int) -
         return {"success": False, "error": str(e)}
 
 
+_LANE_DELETE = """
+import os
+root, rel = {root!r}, {rel!r}
+target = os.path.join(root, rel)
+real = os.path.realpath(target)
+if not real.startswith(os.path.realpath(root) + os.sep):
+    raise SystemExit("outside the workspace")
+if os.path.islink(target) or (os.path.exists(target) and not os.path.isfile(target)):
+    raise SystemExit("not a regular file")
+if os.path.exists(target):
+    os.remove(target)
+print({mark!r} + "ok")
+"""
+
+
 def _run_in_lane(code: str, timeout: int, keep_output: bool = False) -> Dict[str, Any]:
     import asyncio
 
@@ -472,10 +564,11 @@ def _run_in_lane(code: str, timeout: int, keep_output: bool = False) -> Dict[str
             "error": (out.get("stderr") or out.get("error") or "transfer failed").strip()[-300:]}
 
 
-def _scan_windows(root: Path) -> List[Dict[str, Any]]:
+def _scan_windows(root: Path, excl: Optional["_Exclude"] = None) -> List[Dict[str, Any]]:
     """List regular files without following links or junctions, nor opening any."""
     import stat as _stat
 
+    excl = excl or _Exclude()
     reparse = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     out: List[Dict[str, Any]] = []
     stack = [(root, "")]
@@ -492,9 +585,14 @@ def _scan_windows(root: Path) -> List[Dict[str, Any]]:
                 continue
             if e.is_symlink() or getattr(st, "st_file_attributes", 0) & reparse:
                 continue
+            if excl.skip_name(e.name):
+                continue
             rel = f"{prefix}{e.name}"
             if _stat.S_ISDIR(st.st_mode):
-                stack.append((Path(e.path), rel + "/"))
+                if not excl.skip_dir(
+                    e.name, rel, lambda p=e.path: os.path.lexists(os.path.join(p, ".git"))
+                ):
+                    stack.append((Path(e.path), rel + "/"))
             elif _stat.S_ISREG(st.st_mode):
                 out.append({"path": rel, "size": st.st_size, "mtime": st.st_mtime})
     return sorted(out, key=lambda f: f["path"])
@@ -683,7 +781,8 @@ def workspace_pull(files: List[Dict[str, Any]], timeout: int = 300,
 
 
 def workspace_scan(include_sha256: bool = True,
-                   workspace_id: Optional[str] = None) -> Dict[str, Any]:
+                   workspace_id: Optional[str] = None,
+                   exclude: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """What is in the workspace on this machine, for the backend to diff.
 
     Returns one entry per file: relative path, size, mtime and (by default) a
@@ -694,8 +793,11 @@ def workspace_scan(include_sha256: bool = True,
     ``include_sha256=False`` skips hashing for a cheap size/mtime-only pass --
     worth having, because hashing a directory of large captures is not free and
     mtime alone is enough to rule most files out.
+
+    ``exclude`` (see :class:`_Exclude`) prunes folders the backend never syncs.
     """
     root = workspace_root(workspace_id)
+    excl = _Exclude(exclude)
     if _FD_SAFE:
         out_fd: List[Dict[str, Any]] = []
         try:
@@ -707,17 +809,34 @@ def workspace_scan(include_sha256: bool = True,
         except OSError:
             return {"success": True, "path": str(root), "files": []}
         try:
-            _scan_fd(rfd, "", out_fd, include_sha256)
+            _scan_fd(rfd, "", out_fd, include_sha256, excl)
         finally:
             os.close(rfd)
-        return {"success": True, "path": str(root), "files": out_fd}
+        return {"success": True, "path": str(root), "files": out_fd,
+                "pruned": sorted(excl.pruned)}
     if not root.is_dir():
         return {"success": True, "path": str(root), "files": []}
     if _windows_sid():
-        return {"success": True, "path": str(root), "files": _scan_windows(root)}
+        files = _scan_windows(root, excl)
+        return {"success": True, "path": str(root), "files": files,
+                "pruned": sorted(excl.pruned)}
 
     out: List[Dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
+    candidates: List[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        base = "" if base == "." else base + "/"
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not excl.skip_dir(
+                d, base + d,
+                lambda p=os.path.join(dirpath, d): os.path.lexists(os.path.join(p, ".git")),
+            )
+        )
+        candidates.extend(
+            Path(dirpath) / f for f in filenames if not excl.skip_name(f)
+        )
+    for path in sorted(candidates):
         if not path.is_file() or path.is_symlink() or not _single_link(path):
             # Symlinks are skipped deliberately: following one would upload
             # whatever it points at, which on a customer's machine is an
@@ -735,7 +854,8 @@ def workspace_scan(include_sha256: bool = True,
             out.append(entry)
         except OSError:
             continue
-    return {"success": True, "path": str(root), "files": out}
+    return {"success": True, "path": str(root), "files": out,
+            "pruned": sorted(excl.pruned)}
 
 
 def workspace_push(files: List[Dict[str, Any]], timeout: int = 300,
@@ -963,3 +1083,95 @@ def workspace_push_status(job_id: str) -> Dict[str, Any]:
         return {"success": True, "job_id": job_id, "done": job["done"],
                 "total": job["total"], "pushed": job["pushed"],
                 "failed": list(job["failed"]), "skipped": job["skipped"]}
+
+
+# ---------------------------------------------------------------------------
+# Delete: a file removed from the workspace is removed here too
+# ---------------------------------------------------------------------------
+
+
+def _delete_fd(root_fd: int, parts: List[str]) -> Dict[str, Any]:
+    import stat as _stat
+
+    try:
+        parent = _open_chain(root_fd, parts[:-1])
+    except FileNotFoundError:
+        return {"success": True}
+    try:
+        try:
+            st = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"success": True}
+        if not _stat.S_ISREG(st.st_mode):
+            return {"success": False, "error": "not a regular file"}
+        os.unlink(parts[-1], dir_fd=parent)
+        return {"success": True}
+    finally:
+        os.close(parent)
+
+
+def workspace_delete(paths: List[str], workspace_id: Optional[str] = None
+                     ) -> Dict[str, Any]:
+    """Remove the named workspace files from this machine.
+
+    Called by the backend when a file was deleted from the workspace and this
+    machine's copy is unchanged since the two last agreed; without it a
+    deleted file came back on the next sync. Only regular files, never a
+    folder or a link, and only inside the workspace. A file already gone counts
+    as deleted. Never raises: results are per file.
+    """
+    deleted, failed = 0, []
+    if _FD_SAFE:
+        try:
+            home_fd = _open_home()
+            try:
+                root_fd = _open_chain(home_fd, _root_parts(workspace_id))
+            finally:
+                os.close(home_fd)
+        except OSError:
+            return {"success": True, "deleted": 0, "failed": []}
+        try:
+            for rel in paths or []:
+                parts = _parts(rel)
+                if parts is None:
+                    failed.append({"path": rel, "error": "invalid path"})
+                    continue
+                try:
+                    res = _delete_fd(root_fd, parts)
+                except OSError as e:
+                    res = {"success": False, "error": str(e)}
+                if res.get("success"):
+                    deleted += 1
+                else:
+                    failed.append({"path": rel, "error": res.get("error")})
+        finally:
+            os.close(root_fd)
+        return {"success": not failed, "deleted": deleted, "failed": failed}
+
+    sid = _windows_sid()
+    root = workspace_root(workspace_id)
+    for rel in paths or []:
+        if _parts(rel) is None:
+            failed.append({"path": rel, "error": "invalid path"})
+            continue
+        if sid:
+            res = _run_in_lane(_LANE_DELETE.format(root=str(root), rel=rel, mark=_LANE_MARK), 60)
+        else:
+            target = _safe_target(rel, workspace_id)
+            if target is None:
+                res = {"success": False, "error": "invalid path"}
+            elif not os.path.lexists(target):
+                res = {"success": True}
+            elif target.is_symlink() or not target.is_file():
+                res = {"success": False, "error": "not a regular file"}
+            else:
+                try:
+                    target.unlink()
+                    res = {"success": True}
+                except OSError as e:
+                    res = {"success": False, "error": str(e)}
+        if res.get("success"):
+            deleted += 1
+        else:
+            failed.append({"path": rel, "error": res.get("error")})
+    return {"success": not failed, "deleted": deleted, "failed": failed}

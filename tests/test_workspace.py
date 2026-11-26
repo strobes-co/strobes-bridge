@@ -44,7 +44,7 @@ def net(monkeypatch):
         yield b"body:" + url.encode()
 
     def upload(url, data, ct, timeout):
-        sent.append(data)
+        sent.append(data if isinstance(data, bytes) else data.read())
         return 200
 
     def file_pull(path, url, sha, timeout):
@@ -343,3 +343,137 @@ class TestBackgroundPush:
     def test_unknown_job(self):
         st = workspace.workspace_push_status("nope")
         assert st["success"] is False and st["done"] is True
+
+
+
+class TestScanExclusions:
+    """The backend asks the scan to prune what it never syncs; a cloned repo
+    or dependency tree must not be walked and reported after every command."""
+
+    def _tree(self, root):
+        _write(root, "report.md")
+        _write(root, "out/data.json")
+        _write(root, ".DS_Store")
+        _write(root, "tool/.git/HEAD")
+        _write(root, "tool/src/main.py")
+        _write(root, "app/node_modules/pkg/index.js")
+        _write(root, "app/src/app.js")
+        _write(root, "x/__pycache__/m.pyc")
+
+    def test_default_excludes_nothing(self):
+        root = workspace.workspace_root()
+        self._tree(root)
+        paths = {f["path"] for f in workspace.workspace_scan(False)["files"]}
+        assert "tool/src/main.py" in paths and "app/node_modules/pkg/index.js" in paths
+
+    def test_exclusions_prune_repos_dirs_and_hidden(self):
+        root = workspace.workspace_root()
+        self._tree(root)
+        paths = {
+            f["path"]
+            for f in workspace.workspace_scan(
+                False,
+                exclude={"hidden": True, "repos": True, "dirs": ["node_modules", "__pycache__"]},
+            )["files"]
+        }
+        assert paths == {"report.md", "out/data.json", "app/src/app.js"}
+
+    def test_pruned_folders_are_reported(self):
+        root = workspace.workspace_root()
+        self._tree(root)
+        res = workspace.workspace_scan(
+            False, exclude={"repos": True, "dirs": ["node_modules", "__pycache__"]}
+        )
+        assert res["pruned"] == ["app/node_modules", "tool", "x/__pycache__"]
+
+    def test_fallback_walk_prunes_the_same(self, monkeypatch):
+        monkeypatch.setattr(workspace, "_FD_SAFE", False)
+        monkeypatch.setattr(workspace, "_windows_sid", lambda: None)
+        root = workspace.workspace_root()
+        self._tree(root)
+        paths = {
+            f["path"]
+            for f in workspace.workspace_scan(
+                False,
+                exclude={"hidden": True, "repos": True, "dirs": ["node_modules", "__pycache__"]},
+            )["files"]
+        }
+        assert paths == {"report.md", "out/data.json", "app/src/app.js"}
+
+
+class TestDelete:
+    def test_deletes_named_files_only(self):
+        root = workspace.workspace_root()
+        _write(root, "a.txt")
+        _write(root, "keep.txt")
+        res = workspace.workspace_delete(["a.txt", "gone.txt"])
+        assert res == {"success": True, "deleted": 2, "failed": []}
+        assert not (root / "a.txt").exists() and (root / "keep.txt").exists()
+
+    def test_refuses_folders_links_and_escapes(self, tmp_path):
+        root = workspace.workspace_root()
+        (root / "dir").mkdir(parents=True)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        (root / "link.txt").symlink_to(outside)
+        res = workspace.workspace_delete(["dir", "link.txt", "../outside.txt"])
+        assert res["deleted"] == 0 and len(res["failed"]) == 3
+        assert outside.exists() and (root / "dir").is_dir()
+
+    def test_a_symlinked_parent_is_not_followed(self, tmp_path):
+        root = workspace.workspace_root()
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        (victim / "f.txt").write_text("x")
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "sub").symlink_to(victim)
+        res = workspace.workspace_delete(["sub/f.txt"])
+        assert (victim / "f.txt").exists()
+        assert res["deleted"] == 0
+
+
+class TestStreamedUpload:
+    def test_bounded_reader_stops_at_the_signed_length(self, tmp_path):
+        import hashlib
+        import io
+
+        h = hashlib.sha256()
+        b = workspace._Bounded(io.BytesIO(b"abcdefgh"), 5, sha=h)
+        got = b""
+        while True:
+            chunk = b.read(2)
+            if not chunk:
+                break
+            got += chunk
+        assert got == b"abcde" and len(b) == 5
+        assert h.hexdigest() == hashlib.sha256(b"abcde").hexdigest()
+
+    def test_push_sends_a_stream_not_bytes(self, monkeypatch):
+        """Both transports (descriptor-based, and executor.file_push on
+        Windows) hand urllib a bounded stream with an explicit length."""
+        import urllib.request
+
+        root = workspace.workspace_root()
+        _write(root, "big.bin", b"0123456789")
+        seen = {}
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None):
+            seen["type"] = type(req.data)
+            seen["length"] = req.get_header("Content-length")
+            seen["body"] = req.data.read()
+            return Resp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+        res = workspace.workspace_push([{"path": "big.bin", "url": "https://s3/x"}])
+        assert res["pushed"] == 1, res
+        assert seen["type"] is workspace._Bounded
+        assert seen["length"] == "10" and seen["body"] == b"0123456789"

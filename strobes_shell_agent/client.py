@@ -235,7 +235,8 @@ class ShellBridgeClient:
                 "agent_version": AGENT_VERSION,
                 "pack": pack.status(),
                 # Capabilities the platform can rely on for this daemon.
-                "features": ["bg_exec", "workspace_homes", "workspace_bg_push"],
+                "features": ["bg_exec", "workspace_homes", "workspace_bg_push",
+                             "workspace_scan_exclude", "workspace_delete"],
             },
         }))
 
@@ -586,6 +587,14 @@ class ShellBridgeClient:
             return await asyncio.to_thread(
                 workspace.workspace_scan,
                 params.get("include_sha256", True),
+                params.get("workspace_id"),
+                params.get("exclude"),
+            )
+
+        elif command == "workspace_delete":
+            return await asyncio.to_thread(
+                workspace.workspace_delete,
+                params.get("paths") or [],
                 params.get("workspace_id"),
             )
 
