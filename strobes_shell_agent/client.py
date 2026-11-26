@@ -47,6 +47,11 @@ INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 60.0
 BACKOFF_MULTIPLIER = 2.0
 PING_INTERVAL = 30  # seconds
+# How long the WebSocket opening handshake may take. The websockets default is
+# 10s, which a slow or proxied uplink (e.g. a jump host behind a web gateway)
+# overruns -- especially while a pack download shares the link -- and every
+# miss doubles the reconnect backoff.
+OPEN_TIMEOUT = 30  # seconds
 
 
 class ShellBridgeClient:
@@ -72,6 +77,15 @@ class ShellBridgeClient:
         self._ws = None
         self._running = False
         self._stop_event = asyncio.Event()
+        # Server-requested updates are single-flight, and a version that failed
+        # to apply is not retried on every reconnect. Without this, each
+        # identify_ack re-downloaded and re-extracted the whole pack (a pack in
+        # use on Windows cannot be overwritten, so it never converged), and the
+        # download + extraction starved the link and the event loop enough to
+        # time out the next handshake -- a reconnect storm.
+        self._update_lock = asyncio.Lock()
+        self._failed_pack_versions: set = set()
+        self._failed_agent_versions: set = set()
 
     @property
     def ws_url(self) -> str:
@@ -114,6 +128,7 @@ class ShellBridgeClient:
                     "ping_interval": None,  # We handle pings ourselves
                     "max_size": 10_485_760,  # 10MB max message
                     "close_timeout": 5,
+                    "open_timeout": OPEN_TIMEOUT,
                 }
                 if self.ws_url.startswith("wss://") and not self.ssl_verify:
                     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -174,6 +189,19 @@ class ShellBridgeClient:
                 pass
             backoff = min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF)
 
+    async def _send(self, payload: str) -> bool:
+        """Send on the live socket. False when there is none.
+
+        The socket is cleared on disconnect while commands keep running in the
+        background; a command that finishes afterwards must not crash on a
+        ``None`` socket. Its reply belonged to the dead connection anyway.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        await ws.send(payload)
+        return True
+
     async def _send_identify(self):
         """Send identify message with daemon metadata."""
         await self._ws.send(json.dumps({
@@ -202,30 +230,47 @@ class ShellBridgeClient:
         Recognised fields (all optional): ``required_pack_version`` + ``pack_url``,
         ``required_agent_version`` + ``agent_url``. URLs default to the operator-set
         ``STROBES_PACK_URL`` / ``STROBES_AGENT_URL`` when omitted."""
-        try:
-            pack_version = data.get("required_pack_version") or data.get("pack_version")
-            pack_url = data.get("pack_url")
-            if pack.needs_update(pack_version):
-                logger.info("pack update required: have %s, want %s",
-                            pack.installed_version(), pack_version)
-                await asyncio.to_thread(pack.update_pack, pack_url, pack_version)
+        if self._update_lock.locked():
+            logger.info("update already in progress; skipping")
+            return
+        async with self._update_lock:
+            try:
+                pack_version = data.get("required_pack_version") or data.get("pack_version")
+                pack_url = data.get("pack_url")
+                if pack_version in self._failed_pack_versions:
+                    logger.debug("pack %s failed to apply earlier; not retrying", pack_version)
+                elif pack.needs_update(pack_version):
+                    logger.info("pack update required: have %s, want %s",
+                                pack.installed_version(), pack_version)
+                    ok = await asyncio.to_thread(pack.update_pack, pack_url, pack_version)
+                    if not ok:
+                        self._failed_pack_versions.add(pack_version)
+                        logger.warning("pack update to %s failed; will not retry "
+                                       "until the agent restarts", pack_version)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"pack update check skipped: {e}")
 
-            agent_version = data.get("required_agent_version") or data.get("agent_version")
-            agent_url = data.get("agent_url")
-            if agent_version and agent_version != AGENT_VERSION:
-                # apply_update re-execs / exits on success and never returns.
-                await asyncio.to_thread(selfupdate.maybe_update, agent_version, agent_url)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"update check skipped: {e}")
+            try:
+                agent_version = data.get("required_agent_version") or data.get("agent_version")
+                agent_url = data.get("agent_url")
+                if (agent_version and agent_version != AGENT_VERSION
+                        and agent_version not in self._failed_agent_versions):
+                    # apply_update re-execs / exits on success and never returns,
+                    # so getting here means the update did not take.
+                    await asyncio.to_thread(selfupdate.maybe_update, agent_version, agent_url)
+                    self._failed_agent_versions.add(agent_version)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"agent update check skipped: {e}")
 
     async def _ping_loop(self):
         """Send periodic pings to keep connection alive."""
         while self._running and self._ws:
             try:
-                await self._ws.send(json.dumps({
+                if not await self._send(json.dumps({
                     "type": "ping",
                     "timestamp": time.time(),
-                }))
+                })):
+                    break
                 await asyncio.sleep(PING_INTERVAL)
             except ConnectionClosed:
                 break
@@ -303,7 +348,7 @@ class ShellBridgeClient:
         # Send response if request_id provided
         if request_id:
             try:
-                await self._ws.send(json.dumps({
+                await self._send(json.dumps({
                     "type": "response",
                     "request_id": request_id,
                     "data": result,
@@ -340,8 +385,11 @@ class ShellBridgeClient:
                 "request_id": request_id,
                 "data": result,
             })
-            await self._ws.send(payload)
-            logger.info(f"Response sent for {request_id} ({len(payload)}b)")
+            if await self._send(payload):
+                logger.info(f"Response sent for {request_id} ({len(payload)}b)")
+            else:
+                logger.warning(f"Cannot send response for {request_id}: "
+                               "disconnected while it ran")
         except ConnectionClosed:
             logger.warning(f"Cannot send response for {request_id}: connection closed")
         except Exception as e:
