@@ -449,17 +449,31 @@ class TestStreamedUpload:
         assert h.hexdigest() == hashlib.sha256(b"abcde").hexdigest()
 
     def test_push_sends_a_stream_not_bytes(self, monkeypatch):
+        """Both transports (descriptor-based, and executor.file_push on
+        Windows) hand urllib a bounded stream with an explicit length."""
+        import urllib.request
+
         root = workspace.workspace_root()
         _write(root, "big.bin", b"0123456789")
         seen = {}
 
-        def upload(url, data, ct, timeout):
-            seen["type"] = type(data)
-            seen["body"] = data.read()
-            return 200
+        class Resp:
+            status = 200
 
-        monkeypatch.setattr(workspace, "_upload", upload)
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None):
+            seen["type"] = type(req.data)
+            seen["length"] = req.get_header("Content-length")
+            seen["body"] = req.data.read()
+            return Resp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", urlopen)
         res = workspace.workspace_push([{"path": "big.bin", "url": "https://s3/x"}])
-        assert res["pushed"] == 1
-        if workspace._FD_SAFE:
-            assert seen["type"] is workspace._Bounded and seen["body"] == b"0123456789"
+        assert res["pushed"] == 1, res
+        assert seen["type"] is workspace._Bounded
+        assert seen["length"] == "10" and seen["body"] == b"0123456789"
